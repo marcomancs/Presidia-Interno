@@ -251,6 +251,25 @@ const App = (() => {
     // non scarica nulla, mostra un avviso con il link al repo. Ritardato per
     // non rallentare l'avvio; eventuali errori di rete sono silenziosi.
     setTimeout(() => { _checkUpdates(); _avviaControlloPeriodico(); }, delay + 1500);
+    setTimeout(() => { _mostraChangelog(); }, delay + 900);
+  }
+
+  // Novità della versione: compaiono UNA sola volta, alla prima apertura dopo l'aggiornamento.
+  let _chlId = '';
+  async function _mostraChangelog() {
+    let r = null;
+    try { r = await call('changelog_da_mostrare'); } catch (e) {}
+    if (!r || !r.show) return;
+    _chlId = r.id;
+    const t = document.getElementById('chl-t'); if (t) t.textContent = 'Novità della versione ' + (r.versione || '');
+    const s2 = document.getElementById('chl-s'); if (s2) s2.textContent = r.titolo || 'Cosa è cambiato dall\'ultima versione';
+    const ul = document.getElementById('chl-list');
+    if (ul) ul.innerHTML = r.voci.map((v, i) => `<li style="animation-delay:${i * 60}ms">${escHtml(v)}</li>`).join('');
+    const ov = document.getElementById('chl-ov'); if (ov) { ov.classList.add('open'); ov.setAttribute('aria-hidden', 'false'); }
+  }
+  function chiudiChangelog() {
+    const ov = document.getElementById('chl-ov'); if (ov) { ov.classList.remove('open'); ov.setAttribute('aria-hidden', 'true'); }
+    if (_chlId) call('changelog_visto', _chlId).catch(() => {});
   }
 
   function waitForPywebview() {    return new Promise(resolve => {
@@ -275,7 +294,7 @@ const App = (() => {
   }
 
   /* ── View router ────────────────────────────────────────────────────── */
-  const _VIEW_DEPTH = { home: 0, config: 0, client: 1, form: 2 };
+  const _VIEW_DEPTH = { home: 0, config: 0, ras: 1, client: 1, form: 2 };
 
   function showView(name, opts = {}) {
     const prevDepth = _VIEW_DEPTH[state.view] ?? 0;
@@ -293,7 +312,7 @@ const App = (() => {
     const bcSep2 = document.getElementById('bc-sep2');
     const bcChapter = document.getElementById('bc-chapter');
 
-    if (name === 'home' || name === 'config') {
+    if (name === 'home' || name === 'config' || name === 'ras') {
       bc.style.display = 'none';
     } else {
       bc.style.display = 'flex';
@@ -636,6 +655,214 @@ const App = (() => {
     if (res?.error) toast(res.error, 'error');
   }
 
+
+  /* ══ JSON dei tecnici da Drive (maschera in sovrimpressione) ══════════ */
+  const DRIVE_URL = TECH_DRIVE_URL;
+  const driveSt = { clienti: null, filtro: '', ordine: 'az', recenti: 0, lettera: '', cliente: null, sedi: null, caricando: false, err: '' };
+  const _MESI_IT = ['gennaio','febbraio','marzo','aprile','maggio','giugno','luglio','agosto','settembre','ottobre','novembre','dicembre'];
+
+  async function apriDrive() {
+    const ov = document.getElementById('drv-ov'); if (!ov) return;
+    ov.classList.add('open'); ov.setAttribute('aria-hidden', 'false');
+    driveSt.cliente = null; driveSt.sedi = null; driveSt.err = '';
+    document.addEventListener('keydown', _driveKey);
+    if (!driveSt.clienti) await _driveCarica(false); else _renderDrive();
+    setTimeout(() => document.getElementById('drv-q')?.focus(), 250);
+  }
+  function driveChiudi() {
+    const ov = document.getElementById('drv-ov'); if (!ov) return;
+    ov.classList.remove('open'); ov.setAttribute('aria-hidden', 'true');
+    document.removeEventListener('keydown', _driveKey);
+  }
+  function _driveKey(e) { if (e.key === 'Escape') { driveSt.cliente ? driveIndietro() : driveChiudi(); } }
+  async function driveApriBrowser() { const r = await call('open_url', DRIVE_URL); if (r?.error) toast(r.error, 'error'); }
+  async function driveApriClienteBrowser() {
+    if (!driveSt.cliente) return;
+    const r = await call('open_url', 'https://drive.google.com/drive/folders/' + driveSt.cliente.id);
+    if (r?.error) toast(r.error, 'error');
+  }
+  async function driveApriUrl(id) { const r = await call('open_url', 'https://drive.google.com/drive/folders/' + id); if (r?.error) toast(r.error, 'error'); }
+  async function driveAggiorna() { driveSt.cliente = null; driveSt.sedi = null; await _driveCarica(true); }
+  let _drvTimer = null;
+  async function _driveCarica(forza) {
+    driveSt.caricando = !driveSt.clienti; driveSt.err = ''; _renderDrive();
+    const r = await call('drive_clienti', !!forza);
+    if (!r || r.error) { driveSt.caricando = false; driveSt.err = r?.error || 'Impossibile leggere Drive.'; _renderDrive(); return; }
+    _driveApplica(r);
+  }
+  function _driveApplica(r) {
+    driveSt.stato = r.stato || {};
+    if (r.scansionato || !driveSt.stato.attiva) { driveSt.clienti = r.clienti || []; driveSt.nascosti = r.nascosti || 0; }
+    driveSt.caricando = false;
+    clearTimeout(_drvTimer);
+    if (driveSt.stato.attiva) _drvTimer = setTimeout(_drivePoll, 1000);
+    if (!driveSt.cliente && document.getElementById('drv-ov')?.classList.contains('open')) {
+      // non rifare la pagina mentre l'utente scrive: aggiorno solo barra e lista
+      if (document.getElementById('drive-lista')) { _renderDriveBarra(); _renderDriveLista(true); }
+      else _renderDrive();
+    }
+  }
+  async function _drivePoll() {
+    if (!document.getElementById('drv-ov')?.classList.contains('open')) { _drvTimer = setTimeout(_drivePoll, 2000); return; }
+    const r = await call('drive_stato');
+    if (r && !r.error) _driveApplica(r);
+    else _drvTimer = setTimeout(_drivePoll, 2000);
+  }
+  function _renderDriveBarra() {
+    const el = document.getElementById('drv-scan'); if (!el) return;
+    const s = driveSt.stato || {};
+    if (!s.attiva) { el.style.display = 'none'; return; }
+    const p = s.totale ? Math.round(100 * s.fatti / s.totale) : 0;
+    el.style.display = 'block';
+    el.innerHTML = `<div class="drv-scan-t">Leggo le date di caricamento… ${s.fatti}/${s.totale}</div><div class="drv-scan-bar"><i style="width:${p}%"></i></div>`;
+  }
+  function driveFiltro(v) { driveSt.filtro = v || ''; _renderDriveLista(); }
+  function driveOrdine(v) { driveSt.ordine = v; _renderDrive(); }
+  function driveRecenti(g) { driveSt.recenti = driveSt.recenti === g ? 0 : g; _renderDrive(); }
+  function driveSortMenu(ev) {
+    if (ev) ev.stopPropagation();
+    const el = document.getElementById('drv-sort2'); if (!el) return;
+    const open = !el.classList.contains('open');
+    el.classList.toggle('open', open);
+    if (open) {
+      const chiudi = e => { if (!el.contains(e.target)) { el.classList.remove('open'); document.removeEventListener('click', chiudi, true); } };
+      setTimeout(() => document.addEventListener('click', chiudi, true), 0);
+    }
+  }
+  function driveLettera(l) { driveSt.lettera = driveSt.lettera === l ? '' : l; _renderDrive(); }
+  async function driveScegli(i) {
+    const c = (driveSt.clienti || []).find(x => x.id === i);
+    if (!c) return;
+    driveSt.cliente = c; driveSt.sedi = null; driveSt.err = ''; driveSt.caricando = true; _renderDrive();
+    const r = await call('drive_cartelle', c.id);
+    driveSt.caricando = false;
+    if (!r || r.error) driveSt.err = r?.error || 'Errore nella ricerca.';
+    else driveSt.sedi = r.sedi;
+    _renderDrive();
+  }
+  function driveIndietro() { driveSt.cliente = null; driveSt.sedi = null; driveSt.err = ''; _renderDrive(); }
+  async function driveScarica(fid, nome) {
+    showLoading('Download del JSON…');
+    let res; try { res = await call('drive_scarica', fid, nome); } finally { hideLoading(); }
+    if (!res || res.error) { toast(res?.error || 'Download non riuscito', 'error', 7000); return; }
+    driveChiudi();
+    handleJsonLoaded(res);
+  }
+  function _escD(s) { return String(s ?? '').replace(/[&<>"']/g, ch => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch])); }
+  function _dataIt(iso) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); if (!m) return '';
+    return `${+m[3]} ${_MESI_IT[+m[2] - 1]} ${m[1]}`;
+  }
+  function _fa(iso) {
+    const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso || ''); if (!m) return '';
+    const g = Math.round((Date.now() - new Date(+m[1], +m[2] - 1, +m[3]).getTime()) / 86400000);
+    if (g <= 0) return 'oggi'; if (g === 1) return 'ieri'; if (g < 31) return g + ' giorni fa';
+    if (g < 365) return Math.round(g / 30) + (Math.round(g / 30) === 1 ? ' mese fa' : ' mesi fa');
+    return Math.round(g / 365) + (Math.round(g / 365) === 1 ? ' anno fa' : ' anni fa');
+  }
+  const _IC_FOLDER = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></svg>';
+  const _IC_PIN = '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20 10c0 6-8 12-8 12s-8-6-8-12a8 8 0 0 1 16 0z"/><circle cx="12" cy="10" r="3"/></svg>';
+  const _IC_DL = '<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>';
+  const _IC_FILE = '<svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>';
+
+  function _renderDrive() {
+    const b = document.getElementById('drive-body'); if (!b) return;
+    const sub = document.getElementById('drv-sub');
+    if (sub) sub.textContent = driveSt.cliente ? driveSt.cliente.nome : 'Scegli il cliente e scarica il JSON caricato dal tecnico';
+    if (!driveSt.cliente && !driveSt.err && driveSt.stato?.attiva && !(driveSt.clienti && driveSt.clienti.length)) {
+      const st = driveSt.stato, p = st.totale ? Math.round(100 * st.fatti / st.totale) : 0;
+      b.innerHTML = `<div class="drv-load"><div class="drv-spin"></div>
+        <div class="drv-load-t">Preparo l'elenco dei clienti con DVR…</div>
+        <div class="drv-load-s">Solo la prima volta (qualche minuto): controllo ${st.fatti}/${st.totale} clienti su Drive</div>
+        <div class="drv-scan-bar" style="width:min(360px,80%)"><i style="width:${p}%"></i></div></div>`; return;
+    }
+    if (driveSt.caricando) {
+      b.innerHTML = `<div class="drv-load"><div class="drv-spin"></div>
+        <div class="drv-load-t">${driveSt.cliente ? 'Cerco la cartella DVR di ' + _escD(driveSt.cliente.nome) + '…' : 'Leggo l\'elenco clienti da Drive…'}</div>
+        <div class="drv-load-s">Può servire qualche secondo</div></div>`; return;
+    }
+    if (driveSt.err) {
+      b.innerHTML = `<div class="drv-load"><div class="drv-load-t" style="color:#b91c1c">${_escD(driveSt.err)}</div>
+        <button class="drv-btn drv-btn--solid" onclick="App.${driveSt.cliente ? 'driveIndietro' : 'driveAggiorna'}()">Riprova</button></div>`; return;
+    }
+    if (driveSt.cliente) { _renderDriveCliente(b); return; }
+    const chip = (lbl, on, fn) => `<button class="drv-chip ${on ? 'on' : ''}" onclick="${fn}">${lbl}</button>`;
+    b.innerHTML = `<div class="drv-tools">
+        <div class="drv-search"><svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+          <input id="drv-q" type="search" autocomplete="off" placeholder="Cerca cliente…" value="${_escD(driveSt.filtro)}" oninput="App.driveFiltro(this.value)"></div>
+        <div class="drv-sort2" id="drv-sort2">
+          <button type="button" class="drv-sort2-b" onclick="App.driveSortMenu(event)">
+            <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M7 4v16"/><path d="m3 16 4 4 4-4"/><path d="M17 20V4"/><path d="m13 8 4-4 4 4"/></svg>
+            <span>${({ az: 'A → Z', za: 'Z → A', new: 'Più recenti', old: 'Meno recenti' })[driveSt.ordine] || 'A → Z'}</span>
+            <svg class="drv-sort2-c" width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3.4" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg>
+          </button>
+          <div class="drv-sort2-m">${[['az', 'A → Z'], ['za', 'Z → A'], ['new', 'Più recenti'], ['old', 'Meno recenti']].map(([k, l]) =>
+            `<button type="button" class="${driveSt.ordine === k ? 'on' : ''}" onclick="App.driveOrdine('${k}')">${l}</button>`).join('')}</div>
+        </div>
+        <button class="drv-btn" onclick="App.driveAggiorna()" title="Rilegge l'elenco da Drive">↻ Aggiorna</button>
+      </div>
+      <div class="drv-chips">
+        ${chip('Tutti', !driveSt.recenti, 'App.driveRecenti(0)')}${chip('Ultimi 7 giorni', driveSt.recenti === 7, 'App.driveRecenti(7)')}${chip('Ultimi 30 giorni', driveSt.recenti === 30, 'App.driveRecenti(30)')}
+      </div>
+      <div id="drv-scan" class="drv-scan" style="display:none"></div>
+      <div id="drive-lista" class="drv-list"></div>`;
+    _renderDriveBarra(); _renderDriveLista();
+  }
+
+  function _renderDriveLista(noAnim) {
+    const l = document.getElementById('drive-lista'); if (!l) return;
+    const q = driveSt.filtro.trim().toLowerCase();
+    let v = (driveSt.clienti || []).filter(c => !q || c.nome.toLowerCase().includes(q));
+    if (driveSt.lettera) v = v.filter(c => c.nome.trim().toUpperCase().startsWith(driveSt.lettera));
+    if (driveSt.recenti) {
+      const lim = new Date(Date.now() - driveSt.recenti * 86400000).toISOString().slice(0, 10);
+      v = v.filter(c => (c.ultimo || '') >= lim);
+    }
+    const cmp = {
+      new: (a, b) => (b.ultimo || '').localeCompare(a.ultimo || '') || a.nome.localeCompare(b.nome, 'it'),
+      old: (a, b) => (!a.ultimo - !b.ultimo) || (a.ultimo || '').localeCompare(b.ultimo || '') || a.nome.localeCompare(b.nome, 'it'),
+      az: (a, b) => a.nome.localeCompare(b.nome, 'it'), za: (a, b) => b.nome.localeCompare(a.nome, 'it'),
+      new: (a, b) => (b.ultimo || '').localeCompare(a.ultimo || '') || a.nome.localeCompare(b.nome, 'it'),
+      old: (a, b) => (a.ultimo || '').localeCompare(b.ultimo || '') || a.nome.localeCompare(b.nome, 'it'),
+    }[driveSt.ordine];
+    v = v.slice().sort(cmp);
+    if (!v.length) { l.innerHTML = `<div class="drv-empty">Nessun cliente trovato con questi filtri.</div>`; return; }
+    l.innerHTML = v.slice(0, 150).map((c, i) => `<button class="drv-row" style="${noAnim ? 'animation:none' : 'animation-delay:' + Math.min(i, 14) * 22 + 'ms'}" data-id="${_escD(c.id)}" onclick="App.driveScegli(this.dataset.id)">
+        <span class="drv-row-ic">${_IC_FOLDER}</span><span class="drv-row-n">${_escD(c.nome)}</span>
+        ${c.ultimo ? `<span class="drv-row-d" title="Data dell'ultimo caricamento">Caricato il ${_escD(_dataIt(c.ultimo))}</span>` : ''}
+        
+        <svg class="drv-row-go" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="m9 18 6-6-6-6"/></svg></button>`).join('');
+  }
+
+  function _renderDriveCliente(b) {
+    const c = driveSt.cliente, sedi = driveSt.sedi || [];
+    const nJ = sedi.reduce((n, s) => n + s.file.length, 0);
+    let h = `<div class="drv-clhead">
+        <button class="drv-btn" onclick="App.driveIndietro()">← Tutti i clienti</button>
+        <div class="drv-clhead-n"><div class="drv-clhead-t">${_escD(c.nome)}</div>
+          <div class="drv-clhead-s">${sedi.length ? `${sedi.length} ${sedi.length === 1 ? 'sede' : 'sedi'} · ${nJ} JSON disponibili` : 'Nessun JSON disponibile'}</div></div>
+        <button class="drv-btn" onclick="App.driveApriClienteBrowser()">
+          <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.1" stroke-linecap="round" stroke-linejoin="round"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></svg>
+          Apri il cliente nel browser</button></div>`;
+    if (!sedi.length) {
+      h += `<div class="drv-empty"><b>Questo cliente non è gestibile dal software.</b><br>Non ha nessuna cartella DVR con un JSON.</div>`;
+    } else {
+      if (sedi.length > 1) h += `<div class="drv-hint">Questo cliente ha più sedi: scegli quella che ti serve.</div>`;
+      h += `<div class="drv-sedi">` + sedi.map((s, si) => `<div class="drv-sede" style="animation-delay:${si * 70}ms">
+          <div class="drv-sede-h"><span class="drv-sede-ic">${_IC_PIN}</span>
+            <div class="drv-sede-tx"><div class="drv-sede-via">${_escD(s.indirizzo)}</div>
+              <div class="drv-sede-m">${s.anno ? `<span class="drv-tag">Anno ${_escD(s.anno)}</span>` : ''}<span class="drv-tag drv-tag--g">${s.file.length} ${s.file.length === 1 ? 'JSON' : 'JSON'}</span></div></div>
+            <button class="drv-btn drv-btn--sm" data-id="${_escD(s.dvr_id)}" onclick="App.driveApriUrl(this.dataset.id)" title="Apre la cartella DVR di questa sede nel browser">Apri cartella</button></div>
+          <div class="drv-files">` + s.file.map((f, k) => `<div class="drv-file ${k === 0 ? 'top' : ''}">
+              <span class="drv-file-ic">${_IC_FILE}</span>
+              <div class="drv-file-tx"><div class="drv-file-d">${_escD(_dataIt(f.data) || f.nome)}${k === 0 ? '<span class="drv-tag drv-tag--ok">Più recente</span>' : ''}</div>
+                <div class="drv-file-n">${_escD(f.nome)}${f.data ? ' · ' + _escD(_fa(f.data)) : ''}</div></div>
+              <button class="drv-btn ${k === 0 ? 'drv-btn--solid' : ''}" data-fid="${_escD(f.id)}" data-nome="${_escD(f.nome)}"
+                onclick="App.driveScarica(this.dataset.fid, this.dataset.nome)">${_IC_DL} Scarica e apri</button></div>`).join('') + `</div></div>`).join('') + `</div>`;
+    }
+    b.innerHTML = h;
+  }
+
   async function loadJsonFromPath(path) {
     showLoading('Lettura JSON…');
     const res = await call('load_json_from_path', path);
@@ -644,7 +871,18 @@ const App = (() => {
     handleJsonLoaded(res);
   }
 
+  async function _apriRasDaJson(res) {
+    state.ras.cartella = res.cartella;
+    state.ras.riep = res.riepilogo;
+    showView('ras');
+    const r = await call('ras_elenco');
+    state.ras.recenti = (r && r.pacchetti) || [];
+    _renderRas();
+    toast('Checklist RAS riconosciuta: apro la sezione RAS', 'success');
+  }
+
   function handleJsonLoaded(res) {
+    if (res && res.ras) { _apriRasDaJson(res); return; }
     state.jsonRaw       = res.json_raw;
     state.extracted     = res.extracted;
     state.autoFields    = res.assessment?.auto || {};
@@ -948,6 +1186,179 @@ const App = (() => {
     } catch (e) {}
   }
 
+
+  /* ── RAS: Relazione Annuale Sicurezza condomini ────────────────────────── */
+  state.ras = state.ras || { cartella: '', riep: null, recenti: [] };
+
+  // Moduli disponibili per il cliente: DVR sempre; RAS solo se esiste un JSON RAS dello stesso nome.
+  async function _aggiornaModuli() {
+    const nome = state.currentClient?.name || '';
+    let r = null;
+    try { r = await call('moduli_cliente', nome); } catch (e) {}
+    const ras = !!(r && r.ras);
+    state.modRasCartella = ras ? r.ras_cartella : '';
+    const it = document.querySelector('.cxacc-item[data-mod="ras"]');
+    if (!it) return;
+    it.classList.toggle('cxacc-item--off', !ras);
+    if (!ras) it.classList.remove('open');
+    it.querySelector('.cxmenu-group-ic')?.classList.toggle('cxmenu-group-ic--soon', !ras);
+    const chip = document.getElementById('mod-ras-chip'); if (chip) chip.style.display = ras ? 'none' : '';
+  }
+
+  async function apriRasCliente() {
+    const cart = state.modRasCartella;
+    await apriRas();
+    const i = (state.ras.recenti || []).findIndex(p => p.cartella === cart);
+    if (i >= 0) await rasApriRecente(i);
+  }
+
+  async function apriRas() {
+    showView('ras');
+    const r = await call('ras_elenco');
+    state.ras.recenti = (r && r.pacchetti) || [];
+    _renderRas();
+  }
+
+  async function rasScegli() {
+    showLoading('Caricamento JSON RAS…');
+    let res;
+    try { res = await call('ras_apri_dialog'); } finally { hideLoading(); }
+    if (!res || res.cancelled) return;
+    if (res.error) { toast(res.error, 'error', 6000); return; }
+    state.ras.cartella = res.cartella;
+    state.ras.riep = res.riepilogo;
+    const r = await call('ras_elenco');
+    state.ras.recenti = (r && r.pacchetti) || [];
+    _renderRas();
+    toast('JSON RAS caricato', 'success');
+  }
+
+  async function rasApriRecente(i) {
+    const p = (state.ras.recenti || [])[i];
+    if (!p) return;
+    const res = await call('ras_carica', p.cartella);
+    if (!res || res.error) { toast(res?.error || 'JSON non leggibile', 'error'); return; }
+    state.ras.cartella = res.cartella;
+    state.ras.riep = res.riepilogo;
+    _renderRas();
+  }
+
+  function rasChiudi() {
+    state.ras.cartella = '';
+    state.ras.riep = null;
+    _renderRas();
+  }
+
+  let _rasSaveT = null;
+  function rasCampo(k, v) {
+    const r = state.ras.riep; if (!r) return;
+    if (k === 'anno_riferimento') v = v === '' ? '' : (parseInt(v, 10) || v);
+    r.identificazione[k] = v;
+    clearTimeout(_rasSaveT);
+    _rasSaveT = setTimeout(() => {
+      call('ras_salva_dati', state.ras.cartella, r.identificazione).catch(() => {});
+    }, 500);
+  }
+
+  async function rasGenera() {
+    if (!state.ras.cartella) return;
+    try { await call('ras_salva_dati', state.ras.cartella, state.ras.riep.identificazione); } catch (e) {}
+    showLoading('Generazione documenti RAS…');
+    let res;
+    try { res = await call('ras_genera', state.ras.cartella, true); } finally { hideLoading(); }
+    if (!res || res.error) { toast(res?.error || 'Errore generazione RAS', 'error', 7000); return; }
+    const man = res.foto_mancanti || [];
+    toast(`Generati ${res.file.length} documenti` + (man.length ? ` · ${man.length} foto da inserire a mano nel Word` : ''),
+          man.length ? 'warning' : 'success', 6000);
+    state.ras.ultimo = res;
+    _renderRas();
+  }
+
+  async function rasApriCartella() {
+    const res = await call('ras_apri_cartella', state.ras.cartella);
+    if (res && res.error) toast(res.error, 'error');
+  }
+
+  function _rasIn(k, lab, v, tipo) {
+    return `<label class="ras-f"><span>${lab}</span>
+      <input type="${tipo || 'text'}" value="${escAttr(v == null ? '' : v)}"
+        oninput="App.rasCampo('${k}', this.value)"></label>`;
+  }
+
+  function _renderRas() {
+    const box = document.getElementById('ras-body');
+    if (!box) return;
+    const st = state.ras;
+    if (!st.cartella || !st.riep) {
+      const rec = (st.recenti || []).map((p, i) => `
+        <button class="ras-rec" onclick="App.rasApriRecente(${i})">
+          <b>${escHtml(p.nome)}</b>
+          <span>${new Date(p.modificato * 1000).toLocaleDateString('it-IT')}</span>
+        </button>`).join('');
+      box.innerHTML = `
+        <div class="ras-empty">
+          <div class="ras-empty-t">Nessun JSON RAS caricato</div>
+          <div class="ras-empty-s">Premi «Carica JSON RAS» e scegli il file .json esportato dalla checklist.
+            Le foto non si importano: nel Word trovi un segnaposto da sostituire a mano.</div>
+        </div>
+        ${rec ? `<div class="dash-panel ras-panel"><div class="panel-head"><span class="panel-t">JSON già caricati</span></div>
+          <div class="ras-recs">${rec}</div></div>` : ''}`;
+      return;
+    }
+    const r = st.riep, id = r.identificazione || {};
+    const fasce = [['<12', 'Inferiore a 12 m'], ['12-24', '12 – 24 m (LP0)'], ['24-54', '24 – 54 m (LP1)'],
+                   ['54-80', '54 – 80 m (LP2)'], ['>80', 'Superiore a 80 m (LP3)']];
+    const optF = fasce.map(([v, t]) =>
+      `<option value="${escAttr(v)}" ${String(id.altezza_antincendio) === v ? 'selected' : ''}>${t}</option>`).join('');
+    const dataIso = String(id.data_emissione || '').slice(0, 10);
+    const sez = (r.sezioni || []).map(x => `
+      <tr><td>${escHtml(x.rif)}</td><td>${escHtml(x.titolo)}</td>
+        <td>${x.presente === true ? 'Sì' : x.presente === false ? 'No' : '—'}</td>
+        <td>${x.misure}</td><td class="${x.no ? 'ras-bad' : ''}">${x.no}</td>
+        <td>${x.nc || ''}</td><td>${x.foto || ''}</td></tr>`).join('');
+    const forn = (r.fornitori || []).map(f =>
+      `<li>${escHtml(f.impresa || 'Impresa')} <span>${escHtml(f.data || '')}</span></li>`).join('');
+    const ult = st.ultimo && st.ultimo.file ? `
+      <div class="ras-done">Documenti generati:
+        ${st.ultimo.file.map(f => `<div>${escHtml(f.split(/[\\/]/).pop())}</div>`).join('')}
+        <button class="alg-btn" onclick="App.rasApriCartella()">Apri cartella</button></div>` : '';
+    box.innerHTML = `
+      <div class="ras-top">
+        <div class="ras-name">${escHtml(id.nome || 'Condominio')}</div>
+        <button class="alg-btn" onclick="App.rasChiudi()">Cambia JSON</button>
+        <button class="alg-btn alg-btn--solid" onclick="App.rasGenera()">Genera documenti RAS</button>
+      </div>
+      <div class="ras-kpi">
+        <div><b>${r.misure}</b><span>Misure</span></div>
+        <div class="${r.non_attuate ? 'ras-kpi-bad' : ''}"><b>${r.non_attuate}</b><span>Non attuate</span></div>
+        <div><b>${r.non_compilate}</b><span>Non compilate</span></div>
+        <div><b>${r.foto_da_inserire || 0}</b><span>Foto da inserire a mano</span></div>
+        <div><b>${(r.fornitori || []).length}</b><span>Fornitori</span></div>
+      </div>
+      ${ult}
+      <div class="dash-panel ras-panel"><div class="panel-head"><span class="panel-t">Dati generali (modificabili)</span></div>
+        <div class="ras-grid">
+          ${_rasIn('nome', 'Condominio', id.nome)}
+          ${_rasIn('scala', 'Scala', id.scala)}
+          ${_rasIn('via_civico', 'Via e numero', id.via_civico || id.indirizzo)}
+          ${_rasIn('cap', 'CAP', id.cap)}
+          ${_rasIn('comune', 'Comune', id.comune)}
+          ${_rasIn('provincia', 'Provincia', id.provincia)}
+          ${_rasIn('amministratore', 'Amministratore', id.amministratore)}
+          ${_rasIn('anno_riferimento', 'Anno', id.anno_riferimento, 'number')}
+          ${_rasIn('data_emissione', 'Data emissione', dataIso, 'date')}
+          <label class="ras-f"><span>Altezza antincendio</span>
+            <select onchange="App.rasCampo('altezza_antincendio', this.value)"><option value="">—</option>${optF}</select></label>
+        </div>
+      </div>
+      <div class="dash-panel ras-panel"><div class="panel-head"><span class="panel-t">Punti di controllo</span></div>
+        <div class="ras-tw"><table class="ras-t"><thead><tr><th>Rif.</th><th>Punto</th><th>Presente</th>
+          <th>Misure</th><th>No</th><th>N.C.</th><th>Foto</th></tr></thead><tbody>${sez}</tbody></table></div>
+      </div>
+      ${forn ? `<div class="dash-panel ras-panel"><div class="panel-head"><span class="panel-t">Fornitori verificati
+        (una checklist ciascuno)</span></div><ul class="ras-forn">${forn}</ul></div>` : ''}`;
+  }
+
   function setClientSection(name) {
     const panes = {
       menu: 'sec-menu', capitoli: 'sec-capitoli', allegati: 'sec-allegati',
@@ -960,11 +1371,14 @@ const App = (() => {
     });
     // La barra schede è nascosta sul menu, visibile dentro una sezione.
     const tabs = document.getElementById('client-sections');
-    if (tabs) tabs.style.display = (name === 'menu') ? 'none' : '';
+    if (tabs) tabs.style.display = 'none';   // slider rimosso: si torna al menu con «Indietro»
+    const bt = document.getElementById('cx-back-t');
+    if (bt) bt.textContent = (name === 'menu') ? 'Tutti i DVR' : 'Cosa vuoi gestire?';
     document.querySelectorAll('#client-sections .cx-tab').forEach(t => {
       t.classList.toggle('cx-tab--active', t.dataset.sec === name);
     });
     state.clientSection = name;
+    if (name === 'menu') _aggiornaModuli();
     // Il selettore Tipo DVR e le 3 fasi (Controlla dati / Compila capitoli /
     // Genera DVR) compaiono SOLO dentro un elemento del DVR (Capitoli, Allegati,
     // Piano, Lettera), NON sul menu "Cosa vuoi gestire?" né su HACCP/RAS.
@@ -984,6 +1398,11 @@ const App = (() => {
     if (name === 'allegati') _renderAllegatiIndex();
     if (name === 'piano') _renderPianoSection();
     if (name === 'lettera') _renderLetteraSection();
+  }
+
+  function backClient() {
+    if (state.clientSection && state.clientSection !== 'menu') setClientSection('menu');
+    else showHome();
   }
 
   const DVR_SECTIONS = ['capitoli', 'allegati', 'piano', 'lettera'];
@@ -1179,7 +1598,7 @@ const App = (() => {
           ${thumb}
           <label class="alg32-nec"><input type="checkbox" ${on ? 'checked' : ''}
             onchange="App.onAlg32Toggle('${s.id}', this.checked)"> Necessario</label>
-          ${label ? `<span class="alg32-lbl">${escHtml(label)}</span>` : '<span class="alg32-lbl alg32-lbl--muted">cartello</span>'}
+          ${s.img ? '' : (label ? `<span class="alg32-lbl">${escHtml(label)}</span>` : '<span class="alg32-lbl alg32-lbl--muted">cartello</span>')}
           <input class="alg32-pos" type="text" placeholder="Posizione consigliata…"
             value="${escAttr(pos)}" oninput="App.onAlg32Pos('${s.id}', this.value)">
         </div>`;
@@ -1254,6 +1673,11 @@ const App = (() => {
          <input class="piano-in" type="text" placeholder="Tecnico dedicato (Nome Cognome)" value="${escAttr(tec.nome||'')}" oninput="App.onPianoTecnico('nome', this.value)">
          <input class="piano-in" type="text" placeholder="Telefono" value="${escAttr(tec.telefono||'')}" oninput="App.onPianoTecnico('telefono', this.value)">
          <input class="piano-in" type="text" placeholder="Email" value="${escAttr(tec.email||'')}" oninput="App.onPianoTecnico('email', this.value)">
+       </div>
+       <div class="piano-tec">
+         <input class="piano-in" type="text" placeholder="Safety Account (Nome Cognome)" value="${escAttr(tec.sa_nome||'')}" oninput="App.onPianoTecnico('sa_nome', this.value)">
+         <input class="piano-in" type="text" placeholder="Safety Account — Telefono" value="${escAttr(tec.sa_telefono||'')}" oninput="App.onPianoTecnico('sa_telefono', this.value)">
+         <input class="piano-in" type="text" placeholder="Safety Account — Email" value="${escAttr(tec.sa_email||'')}" oninput="App.onPianoTecnico('sa_email', this.value)">
        </div>
        ${_estintoriPesoHtml(tec)}
        <div class="piano-actions">
@@ -1513,6 +1937,69 @@ const App = (() => {
     if (res && res.error) toast(res.error, 'info');
   }
 
+  const _WARN_TRI = '<svg width="14" height="14" viewBox="0 0 24 24" fill="#f59e0b" stroke="#fff" stroke-width="1.6" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4" stroke="#7c2d12" stroke-linecap="round"/><circle cx="12" cy="16.8" r=".6" fill="#7c2d12" stroke="#7c2d12"/></svg>';
+  function _warnTri(px, col) {
+    return `<svg width="${px}" height="${px}" viewBox="0 0 24 24" fill="${col || '#f59e0b'}" stroke="#fff" stroke-width="1.5" stroke-linejoin="round"><path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/><path d="M12 9v4.2" stroke="#fff" stroke-width="2" stroke-linecap="round"/><circle cx="12" cy="16.9" r="1.1" fill="#fff" stroke="none"/></svg>`;
+  }
+  // Menu «Cosa vuoi gestire?»: apertura al passaggio del mouse con ritardo (hover-intent)
+  function _initCxAcc() {
+    const root = document.querySelector('.cxacc');
+    if (!root || root._acc) return;
+    root._acc = true;
+    const items = [...root.querySelectorAll('.cxacc-item:not(.cxacc-item--off)')];
+    let tOpen = null, tClose = null;
+    const apri = it => { items.forEach(o => { if (o !== it) o.classList.remove('open'); }); it.classList.add('open'); };
+    items.forEach(it => {
+      it.addEventListener('mouseenter', () => {
+        clearTimeout(tClose); clearTimeout(tOpen);
+        tOpen = setTimeout(() => apri(it), 110);
+      });
+    });
+    root.addEventListener('mouseleave', () => {
+      clearTimeout(tOpen); clearTimeout(tClose);
+      tClose = setTimeout(() => items.forEach(o => o.classList.remove('open')), 220);
+    });
+  }
+  document.addEventListener('DOMContentLoaded', _initCxAcc);
+  setTimeout(_initCxAcc, 600);
+  const _WX_LV = { errore: 'Da correggere', attenzione: 'Attenzione', info: 'Suggerimento' };
+  function _wxCards(avvisi) {
+    return avvisi.map(a => {
+      const t = a.target ? ` data-cl-goto="${escAttr(JSON.stringify(a.target))}"` : '';
+      const lv = escAttr(a.livello);
+      return `<div class="wx-card wx-c-${lv}${a.target ? ' wx-go' : ''}"${t}>
+        <span class="wx-bar"></span>
+        <div class="wx-main">
+          <div class="wx-meta"><span class="wx-lv">${_WX_LV[a.livello] || ''}</span>${a.capitolo ? `<span class="warn-cap">${escHtml(a.capitolo)}</span>` : ''}</div>
+          <div class="wx-msg">${escHtml(a.messaggio)}</div>
+          ${a.soluzione ? `<div class="wx-fix"><b>Come risolvere</b>${escHtml(a.soluzione)}</div>` : ''}
+        </div>
+        ${a.target ? '<span class="wx-arrow" title="Vai al campo"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h14"/><path d="m13 6 6 6-6 6"/></svg></span>' : ''}
+      </div>`;
+    }).join('');
+  }
+  function _wxBox(avvisi, listId, chevId, toggleFn, extraFoot) {
+    const nErr = avvisi.filter(a => a.livello === 'errore').length;
+    const sev = nErr ? 'errore' : 'attenzione';
+    const n = avvisi.length;
+    return `<div class="wx wx-${sev}">
+      <span class="wx-badge">${_warnTri(34, nErr ? '#dc2626' : '#f59e0b')}</span>
+      <div class="wx-head" onclick="App.${toggleFn}()">
+        <div class="wx-ht"><span class="wx-t">Controllo dati</span><span class="wx-s">${n} segnalazion${n === 1 ? 'e' : 'i'} da verificare prima di generare il DVR</span></div>
+        <span class="wx-pills">${_warnRiepilogo(avvisi)}</span>
+        <span class="wx-chev" id="${chevId}"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.6" stroke-linecap="round" stroke-linejoin="round"><path d="m6 9 6 6 6-6"/></svg></span>
+      </div>
+      <div class="wx-list" id="${listId}" style="display:none">${_wxCards(avvisi)}${extraFoot || ''}</div>
+    </div>`;
+  }
+  function _warnRiepilogo(av) {
+    const n = l => av.filter(x => x.livello === l).length;
+    const p = [];
+    if (n('errore')) p.push(`<span class="warn-pill w-err">${n('errore')} da correggere</span>`);
+    if (n('attenzione')) p.push(`<span class="warn-pill w-att">${n('attenzione')} attenzione</span>`);
+    if (n('info')) p.push(`<span class="warn-pill w-inf">${n('info')} suggerimenti</span>`);
+    return p.length ? ' ' + p.join('') : '';
+  }
   // 3 passi IN LINEA nella testata navy della pagina cliente.
   async function _renderClientSteps(client, done, total) {
     const box = document.getElementById('cd-steps');
@@ -1525,10 +2012,17 @@ const App = (() => {
     const s1txt = nAvv ? `${nAvv} da sistemare` : 'A posto';
     const s3cls = allDone ? 'ok' : '';
     const s3txt = allDone ? 'Pronto' : 'In attesa';
+    const dl = document.getElementById('cd-download-btn');
+    if (dl) dl.style.display = allDone ? '' : 'none';
+    const clb = document.getElementById('cd-checklist-btn');
+    if (clb) {
+      clb.querySelectorAll('.warn-tri').forEach(n => n.remove());
+      if (nAvv) clb.insertAdjacentHTML('beforeend', `<span class="warn-tri" title="${nAvv} incongruenze nei dati">${_WARN_TRI}</span>`);
+    }
     box.innerHTML = `
       <div class="cd-phase ${s1cls}" onclick="App.openChecklist()">
         <span class="cd-phase-n">1</span>
-        <span class="cd-phase-l">Controlla i dati</span>
+        <span class="cd-phase-l">Controlla i dati${nAvv ? `<span class="warn-tri" title="${nAvv} incongruenze">${_WARN_TRI}</span>` : ''}</span>
         <span class="cd-phase-v">${s1txt}</span>
       </div>
       <div class="cd-phase active">
@@ -1536,7 +2030,7 @@ const App = (() => {
         <span class="cd-phase-l">Compila i capitoli</span>
         <span class="cd-phase-v">${done}/${total}</span>
       </div>
-      <div class="cd-phase ${s3cls}" onclick="App.compileAllToFolder('docx')">
+      <div class="cd-phase ${s3cls}" ${allDone ? `onclick="App.compileAllToFolder('all')"` : ''}>
         <span class="cd-phase-n">3</span>
         <span class="cd-phase-l">Genera il DVR</span>
         <span class="cd-phase-v">${s3txt}</span>
@@ -1672,7 +2166,7 @@ const App = (() => {
     const _nEscl = chaptersInfo.filter(ch => _isCapEscluso(ch.id)).length;
     const _magicBtn = _nEscl > 0
       ? `<button class="ch-magic" onclick="App.toggleShowExcluded()" title="Mostra/nascondi i capitoli non applicabili">
-           ✨ ${state.showExcluded ? 'Nascondi' : 'Mostra'} capitoli esclusi (${_nEscl})
+           ${state.showExcluded ? 'Nascondi' : 'Mostra'} capitoli esclusi (${_nEscl})
          </button>`
       : '';
     grid.innerHTML = '<div id="client-warn-banner"></div>'
@@ -1770,27 +2264,8 @@ const App = (() => {
     let avvisi = [];
     try { avvisi = await call('controlla_dati', path) || []; } catch (e) { avvisi = []; }
     if (!avvisi.length) { box.innerHTML = ''; return; }
-    const ic = (lv) => lv === 'errore' ? '⛔' : lv === 'attenzione' ? '⚠️' : 'ℹ️';
-    const nErr = avvisi.filter(a => a.livello === 'errore').length;
-    const sev = nErr ? 'errore' : 'attenzione';
-    box.innerHTML = `
-      <div class="client-warn cw-${sev}">
-        <div class="client-warn-head" onclick="App.toggleClientWarn()">
-          <span class="cw-ico">${ic(sev)}</span>
-          <span class="cw-text"><b>Controllo dati:</b> ${avvisi.length} incongruenz${avvisi.length === 1 ? 'a' : 'e'} da sistemare</span>
-          <span class="cw-chevron" id="cw-chevron">▾</span>
-        </div>
-        <div class="client-warn-list" id="client-warn-list" style="display:none">
-          ${avvisi.map(a => {
-            const t = a.target ? ` data-cl-goto="${escAttr(JSON.stringify(a.target))}"` : '';
-            return `<div class="cw-item cw-item-${escAttr(a.livello)}${a.target ? ' cw-item-clickable' : ''}"${t}>
-            <div class="cw-msg">${ic(a.livello)} ${escHtml(a.messaggio)}${a.target ? ' <span class="cl-warn-go">→ apri e correggi</span>' : ''}</div>
-            ${a.soluzione ? `<div class="cw-fix"><b>Come risolvere:</b> ${escHtml(a.soluzione)}</div>` : ''}
-          </div>`;
-          }).join('')}
-          <div class="cw-foot"><button class="btn btn-outline btn-sm" onclick="App.openChecklist()">Apri checklist dati</button></div>
-        </div>
-      </div>`;
+    box.innerHTML = _wxBox(avvisi, 'client-warn-list', 'cw-chevron', 'toggleClientWarn',
+      '<div class="wx-foot"><button class="btn btn-outline btn-sm" onclick="App.openChecklist()">Apri la checklist dati</button></div>');
     box.querySelectorAll('[data-cl-goto]').forEach(el =>
       el.addEventListener('click', () => gotoChecklistField(el.getAttribute('data-cl-goto'))));
   }
@@ -1801,7 +2276,7 @@ const App = (() => {
     if (!list) return;
     const open = list.style.display === 'none';
     list.style.display = open ? 'block' : 'none';
-    if (chev) chev.textContent = open ? '▴' : '▾';
+    list.closest('.wx')?.classList.toggle('open', open);
   }
 
   function toggleChecklistWarn() {
@@ -1810,7 +2285,7 @@ const App = (() => {
     if (!list) return;
     const open = list.style.display === 'none';
     list.style.display = open ? 'block' : 'none';
-    if (chev) chev.textContent = open ? '▾' : '▸';
+    list.closest('.wx')?.classList.toggle('open', open);
   }
 
   function _showChapterCompleteAnim(chapterId, onDone) {
@@ -1969,7 +2444,7 @@ const App = (() => {
       const hasNext = idx < active.length - 1;
       const nextLabel = hasNext ? 'Prossimo Capitolo →' : 'Fine — Torna alla Lista ✓';
       // Cap6, Cap7 e Cap10 sono internalizzati (nessun Excel) → niente tasto "Apri fogli Excel".
-      const hasFogli = ['11'].includes(String(chapterId));
+      const hasFogli = false;  // Cap6, 7, 10 e 11 sono internalizzati (nessun Excel)
       const btnFogli = hasFogli ? `
         <button class="btn btn-ghost" id="btn-fogli-xls" onclick="App.apriFogliCalcolo('${chapterId}')"
           title="Apre in Excel i fogli di calcolo del capitolo (schede/gruppi selezionati)">
@@ -2008,11 +2483,13 @@ const App = (() => {
       for (const fd of state.manualFields) {
         if (fd.type && fd.type.endsWith('_editor')
             && savedFormData[fd.id] && typeof savedFormData[fd.id] === 'object'
-            && !(fd.id === 'cap10_editor' && savedFormData[fd.id].versione !== 2)) {
+            && !(fd.id === 'cap10_editor' && savedFormData[fd.id].versione !== 2)
+            && !(fd.id === 'cap11_editor' && savedFormData[fd.id].versione !== 2)) {
           state.tablePrefill[fd.id] = savedFormData[fd.id];
         }
       }
     }
+    await _attrShareApply(chapterId);
 
     renderManualFields(state.manualFields, state.tablePrefill);
 
@@ -2650,6 +3127,7 @@ const App = (() => {
       const cap11Data = (prefill[fd.id] || state.tablePrefill[fd.id] || {});
       initCap11Editor(fd.id, cap11Data);
       wrap.innerHTML = buildCap11Editor(fd.id, cap11Data);
+      setTimeout(() => _c11InitRisultati(fd.id), 0);
 
     } else if (fd.type === 'cap21_editor') {
       wrap.style.gridColumn = '1 / -1';
@@ -3110,6 +3588,12 @@ const App = (() => {
   }
 
   /* ── Gruppo pronto soccorso (calcolo lato client) ───────────────────── */
+  function onGruppoManuale(val) {
+    state.formValues['gruppo_manuale'] = val || '';
+    updateGruppo();
+    saveChapterDraft();
+  }
+
   function updateGruppo() {
     // Totale lavoratori: il campo unico `num_lavoratori` (dal JSON) è la fonte;
     // fallback alla vecchia somma uomini+donne+minorenni per i JSON vecchi.
@@ -3132,12 +3616,14 @@ const App = (() => {
 
     box.style.display = 'flex';
     let gruppo = '', title = '', spieg = '';
+    const man = String(state.formValues['gruppo_manuale'] || '').toUpperCase();
     if      (agr && tot > 5)      { gruppo = 'A3'; title = 'Gruppo A3'; spieg = `Attività agricola · ${tot} lavoratori a tempo pieno`; }
     else if (tot > 5 && idx > 4) { gruppo = 'A2'; title = 'Gruppo A2'; spieg = `${tot} lavoratori · indice INAIL ${idx.toFixed(2)} > 4`; }
     else if (tot > 5)            { gruppo = 'A1'; title = 'Gruppo A1'; spieg = `${tot} lavoratori · indice INAIL ${idx.toFixed(2)} ≤ 4`; }
     else if (tot >= 3)           { gruppo = 'B';  title = 'Gruppo B';  spieg = `${tot} lavoratori`; }
     else                         { gruppo = 'C';  title = 'Gruppo C';  spieg = `${tot} lavoratori totali`; }
 
+    if (['A1', 'A2', 'A3', 'B', 'C'].includes(man)) { spieg = `Scelto a mano (calcolo automatico: ${gruppo})`; gruppo = man; title = 'Gruppo ' + man; }
     const levelClass = gruppo.startsWith('A') ? 'level-a'
                      : (gruppo === 'B' ? 'level-b' : 'level-c');
     box.className = `gruppo-box ${levelClass}`;
@@ -3146,7 +3632,11 @@ const App = (() => {
       <div class="gruppo-info">
         <div class="gruppo-title">${escHtml(title)} — DM 388/2003</div>
         <div class="gruppo-desc">${escHtml(spieg)}</div>
-      </div>`;
+      </div>
+      <select class="field-input" style="max-width:150px;margin-left:auto" title="Scegli il gruppo a mano"
+        onchange="App.onGruppoManuale(this.value)">
+        ${['', 'A1', 'A2', 'A3', 'B', 'C'].map(g => `<option value="${g}"${g === man ? ' selected' : ''}>${g ? 'Gruppo ' + g + ' (manuale)' : 'Automatico'}</option>`).join('')}
+      </select>`;
 
     state.formValues['gruppo_pronto_soccorso'] = gruppo;
     state.autoFields['gruppo_pronto_soccorso'] = gruppo;
@@ -3194,11 +3684,12 @@ const App = (() => {
     'Calzature protettive contro il taglio da motosega (EN ISO 17249)',
     'Ghette antitaglio per motosega (EN ISO 11393-5)',
     'Protezioni antitaglio per busto e braccia (EN ISO 11393-6, secondo il dispositivo)',
-    'Imbracature anticaduta (EN 361)', 'Cordini di trattenuta e posizionamento (EN 358)',
-    'Assorbitori di energia (dissipatori) (EN 355)',
-    'Dispositivi anticaduta retrattili (EN 360)', 'Dispositivi di ancoraggio (EN 795)',
-    'Connettori (EN 362)', 'Cappello anti UV (EN 13758-2)',
+    'Dispositivi anticaduta (EN 360-1-2-3)',
+    'Cappello anti UV (EN 13758-2)',
     'Abbigliamento anti UV (EN 13758-2)',
+    'Creme protettive per raggi UV',
+    'Giubbotto di salvataggio (EN 12402)',
+    'Cuffia TNT',
   ];
 
   // Lista schede in JS (speculare alla lista Python)
@@ -3370,6 +3861,11 @@ const App = (() => {
           onclick="App.addCap2Fase('${fieldId}',${gi})">
           ${ic('plus',11)} Aggiungi fase
         </button>
+        <button class="btn-add-row" style="margin-bottom:16px;margin-left:8px"
+          title="Crea una fase per ogni titolo (riga breve senza punto finale) della descrizione sintetica"
+          onclick="App.importaFasiDaDescrizione('${fieldId}',${gi})">
+          Prendi i titoli dalla descrizione
+        </button>
 
         <details class="dpi-details" style="margin-top:8px">
           <summary class="dpi-summary">DPI — Dispositivi di Protezione Individuale <span class="dpi-hint">(clicca per aprire)</span></summary>
@@ -3467,6 +3963,7 @@ const App = (() => {
     const g = state.formValues[fieldId].gruppi[gi];
     if (key === 'attrezzature_text') {
       g.attrezzature = value.split('\n').map(s => s.trim()).filter(Boolean);
+      _attrShareSave('2', fieldId);
     } else if (key === 'chimici_text') {
       g.prodotti_chimici = value.split('\n').map(s => s.trim()).filter(Boolean);
     } else if (key === 'agenti_cancerogeni_text') {
@@ -3583,6 +4080,41 @@ const App = (() => {
       container.appendChild(div.firstElementChild);
       _renumberCap2Fasi(container);
     }
+  }
+
+  // Titoli delle fasi presi dalla descrizione sintetica: ogni riga breve (≤ 90 caratteri, senza
+  // punto finale) diventa una fase, così il titolo si scrive una volta sola.
+  function importaFasiDaDescrizione(fieldId, gi) {
+    _ensureCap2State(fieldId, gi);
+    const g = state.formValues[fieldId].gruppi[gi];
+    const titoli = String(g.descrizione || '').split(/\r?\n/).map(s => s.trim())
+      .filter(s => s && s.length <= 90 && !/[.;:]$/.test(s));
+    if (!titoli.length) { toast('Nella descrizione non ci sono righe-titolo (una per riga, brevi, senza punto finale).', 'info', 5000); return; }
+    if (!g.fasi) g.fasi = [];
+    const esistenti = new Set(g.fasi.map(f => String(f.fase || '').trim().toLowerCase()));
+    const container = document.getElementById(`cap2-g${gi}-fasi`);
+    let n = 0;
+    titoli.forEach(t => {
+      if (esistenti.has(t.toLowerCase())) return;
+      // riusa una fase vuota se presente, altrimenti ne aggiunge una
+      const vuota = g.fasi.findIndex(f => !String(f.fase || '').trim());
+      if (vuota >= 0) {
+        g.fasi[vuota].fase = t;
+        const inp = container && container.querySelectorAll('.cap2-fase-row')[vuota]?.querySelector('input[type=text]');
+        if (inp) inp.value = t;
+      } else {
+        const fi = g.fasi.length;
+        g.fasi.push({ fase: t });
+        if (container) {
+          const div = document.createElement('div');
+          div.innerHTML = buildFaseRow(`cap2-g${gi}`, fi, { fase: t });
+          container.appendChild(div.firstElementChild);
+        }
+      }
+      esistenti.add(t.toLowerCase()); n++;
+    });
+    if (container) _renumberCap2Fasi(container);
+    toast(n ? `${n} fase/i aggiunta/e dalla descrizione` : 'Le fasi della descrizione ci sono già', n ? 'success' : 'info', 3500);
   }
 
   function removeCap2Fase(btn) {
@@ -4037,6 +4569,7 @@ const App = (() => {
     }
     arr.push({ ref: arr.length + 1, nome, ce: 'Sì', ante_ce: 'No', selezionata: true });
     saveChapterDraft();
+    _attrShareSave('4', fieldId);
     _rerenderCap4Attr(fieldId);
   }
 
@@ -4046,6 +4579,7 @@ const App = (() => {
     arr.splice(idx, 1);
     arr.forEach((a, i) => { a.ref = i + 1; });
     saveChapterDraft();
+    _attrShareSave('4', fieldId);
     _rerenderCap4Attr(fieldId);
   }
 
@@ -4462,6 +4996,51 @@ const App = (() => {
   function _rerenderCap14Prods(fieldId) {
     const box = document.getElementById(`cap14-prods-${fieldId}`);
     if (box) box.innerHTML = _cap14ProductsHtml(fieldId);
+  }
+
+  // Elenco attrezzature UNIVOCO Cap2↔Cap4: ogni modifica si salva sul backend (fonte
+  // unica per cliente) e l'altro capitolo si allinea all'apertura e all'export.
+  let _attrShareT = null;
+  function _attrShareSave(origine, fieldId) {
+    const jp = state.currentClient?.json_path;
+    const ed = state.formValues[fieldId] || {};
+    if (!jp) return;
+    let payload;
+    if (origine === '4') {
+      payload = (ed.attrezzature || []).map(a => (a.nome || '').trim()).filter(Boolean);
+    } else {
+      payload = {};
+      (ed.gruppi || []).forEach(g => {
+        const k = (g.nome || '').trim().toLowerCase();
+        if (k) payload[k] = (g.attrezzature || []).map(x => String(x).trim()).filter(Boolean);
+      });
+    }
+    clearTimeout(_attrShareT);
+    _attrShareT = setTimeout(() =>
+      call('sync_attrezzature_condivise', jp, origine, payload).catch(() => {}), 300);
+  }
+
+  // All'apertura di Cap2/Cap4: applica l'elenco condiviso sopra la bozza salvata.
+  async function _attrShareApply(chapterId) {
+    const jp = state.currentClient?.json_path;
+    if (!jp || !['2', '4'].includes(String(chapterId))) return;
+    const r = await call('get_attrezzature_condivise', jp);
+    const sh = r && r.dati;
+    if (!sh || !Array.isArray(sh.elenco)) return;
+    const K = n => String(n || '').trim().replace(/\s+/g, ' ').toLowerCase();
+    const ed4 = state.tablePrefill['cap4_editor'];
+    if (String(chapterId) === '4' && ed4 && Array.isArray(ed4.attrezzature)) {
+      const old = {}; ed4.attrezzature.forEach(a => { old[K(a.nome)] = a; });
+      ed4.attrezzature = sh.elenco.map((n, i) => Object.assign(
+        { ce: 'Sì', ante_ce: 'No', selezionata: true }, old[K(n)] || {}, { ref: i + 1, nome: n }));
+    }
+    const ed2 = state.tablePrefill['cap2_gruppi'];
+    if (String(chapterId) === '2' && ed2 && Array.isArray(ed2.gruppi)) {
+      ed2.gruppi.forEach(g => {
+        const l = (sh.gruppi || {})[K(g.nome)];
+        if (Array.isArray(l)) g.attrezzature = l.slice();
+      });
+    }
   }
 
   // #4: lista prodotti CONDIVISA Cap2↔Cap14. A ogni modifica nel Cap14 si salva
@@ -4925,6 +5504,7 @@ const App = (() => {
                 style="display:flex;align-items:center;gap:10px;padding:6px 10px;border-bottom:1px solid var(--border)">
         <span class="cap0-cap-id" style="min-width:52px;font-weight:600;color:var(--gray-600)">Cap. ${m.id}</span>
         <span class="cap0-cap-title" style="flex:1;font-size:13px">${escHtml(m.titolo)} ${badge}</span>
+        <span class="cap0-pill ${on ? 'in' : 'out'}">${on ? 'Nel DVR' : 'Escluso'}</span>
         ${btns}
       </div>`;
     }).join('');
@@ -4968,6 +5548,8 @@ const App = (() => {
       const btns = row.querySelectorAll('.field-sn-btn');
       btns.forEach(b => b.classList.remove('field-sn-active'));
       if (btns.length === 2) (applicabile ? btns[0] : btns[1]).classList.add('field-sn-active');
+      const pill = row.querySelector('.cap0-pill');
+      if (pill) { pill.className = 'cap0-pill ' + (applicabile ? 'in' : 'out'); pill.textContent = applicabile ? 'Nel DVR' : 'Escluso'; }
     }
     saveChapterDraft();
   }
@@ -6341,12 +6923,19 @@ const App = (() => {
     }
     // Raggruppa le schede per GRUPPO OMOGENEO, conservando l'indice originale
     // (serve agli handler). Tutti i gruppi vengono mostrati, anche se è uno solo.
+    // Le schede sono raggruppate per MOVIMENTAZIONE (come nel Word: più S + la T),
+    // non per gruppo omogeneo; il gruppo compare nell'intestazione.
     const groups = [];
     const byKey = new Map();
     schede.forEach((s, i) => {
-      const key = (s.gruppo || '').trim() || '—';
+      const key = String(s.mov !== undefined && s.mov !== null ? s.mov : ('g:' + (s.gruppo || '')));
       let g = byKey.get(key);
-      if (!g) { g = { nome: (s.gruppo || '').trim(), items: [] }; byKey.set(key, g); groups.push(g); }
+      if (!g) {
+        g = { nome: (s.gruppo || '').trim(), mov: s.mov, libera: s.origine === 'libera',
+              gnum: s.gruppo_num || '', descr: s.descrizione || s.carico || '', items: [] };
+        byKey.set(key, g); groups.push(g);
+      }
+      if (!g.descr) g.descr = s.descrizione || s.carico || '';
       g.items.push({ s, i });
     });
     // nomi dei gruppi di ogni blocco (per il pulsante «Seleziona template»)
@@ -6362,8 +6951,8 @@ const App = (() => {
       return `
       <details class="c6n-group c6n-group--acc"${open} data-key="${escAttr(key)}" data-nomi="${escAttr(JSON.stringify(state.cap6GroupMans[gi] || []))}" ontoggle="App.c6CalcToggle(this)">
         <summary class="c6n-group-hdr">
-          <span class="c6n-group-tag">Gruppo ${gi + 1}</span>
-          <span class="c6n-group-nome">${escHtml(g.nome || 'Gruppo omogeneo')}</span>
+          <span class="c6n-group-tag">Movimentazione ${gi + 1}</span>
+          <span class="c6n-group-nome">${escHtml(g.descr || 'Movimentazione')} <small style="opacity:.75">· ${g.gnum ? 'Gruppo ' + escHtml(String(g.gnum)) + ' — ' : ''}${escHtml(g.nome || '')}</small></span>
           <span class="c6n-group-badge">${g.items.length} scheda/e</span>
           <button type="button" class="c6n-group-tpl" title="Usa i modelli del catalogo al posto della valutazione specifica del tecnico"
             onclick="event.preventDefault();event.stopPropagation();App.cap6UsaTemplate('${fieldId}', ${gi}, true)">Seleziona template</button>
@@ -6371,6 +6960,13 @@ const App = (() => {
         </summary>
         <div class="c6n-group-body">
           ${g.items.map(({ s, i }) => s.tipo === 'T' ? _cap6SchedaTHtml(s, i) : _cap6SchedaSHtml(s, i)).join('')}
+          ${g.libera && typeof g.mov === 'number' ? `<div class="c6n-addrow">
+            <b>Aggiungi una scheda S a questa movimentazione</b> (si aggancia alla stessa scheda T):
+            <select id="c6add-sex-${g.mov}"><option value="M">Maschi</option><option value="F">Femmine</option></select>
+            <select id="c6add-eta-${g.mov}"><option value="20-45">20–45 anni</option><option value="altro">Oltre 45 anni</option></select>
+            <button type="button" class="btn btn-outline btn-sm" onclick="App.cap6AddS(${g.mov})">+ Aggiungi scheda S</button>
+            <button type="button" class="btn btn-ghost btn-sm c6n-delmov" onclick="App.cap6DelMov(${g.mov})">Elimina movimentazione</button>
+          </div>` : ''}
         </div>
       </details>`;
     }).join('');
@@ -6378,12 +6974,55 @@ const App = (() => {
     box.innerHTML = `<div class="cap2-section-label">Schede di calcolo — MMC</div>
       ${groupsHtml}
       ${_cap6AddHtml(fieldId)}
+      ${schede.some(x => x.origine === 'libera') ? '<div style="margin:6px 0"><button type="button" class="btn btn-ghost btn-sm" onclick="App.cap6Ripristina()">↺ Ripristina le schede originali</button></div>' : ''}
       <div class="c6n-misure-bar">
         <button type="button" class="btn btn-primary c6n-misure-btn" onclick="App.openCap6Misure()">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           Misure di prevenzione e protezione</button>
         <span class="cap14-note">Valgono per tutte le schede di tutti i gruppi: verranno spuntate nel modello SCHEDA MOVIMENTAZIONE CARICHI.</span>
       </div>`;
+  }
+
+  // Valutazione libera: il back-office può aggiungere/eliminare schede S.
+  function _cap6FieldId() {
+    const el = document.querySelector('[id^="cap6-native-"]');
+    return el ? el.id.replace('cap6-native-', '') : null;
+  }
+  async function _cap6Reload() {
+    const fid = _cap6FieldId();
+    state.cap6Schede = null;
+    if (fid) await _loadCap6Native(fid);
+  }
+  async function cap6AddS(mov) {
+    const jp = state.currentClient?.json_path; if (!jp) return;
+    const sx = document.getElementById('c6add-sex-' + mov)?.value || 'M';
+    const eta = document.getElementById('c6add-eta-' + mov)?.value || '20-45';
+    const r = await call('cap6_aggiungi_scheda_s', jp, mov, sx, eta);
+    if (!r || !r.ok) { toast((r && r.error) || 'Impossibile aggiungere la scheda', 'error'); return; }
+    await _cap6Reload();
+  }
+  async function cap6DelS(i) {
+    const jp = state.currentClient?.json_path; const s = (state.cap6Schede || [])[i];
+    if (!jp || !s) return;
+    if (!window.confirm(`Eliminare la scheda ${s.n}?`)) return;
+    const r = await call('cap6_elimina_scheda', jp, s.id, false);
+    if (!r || !r.ok) { toast((r && r.error) || 'Impossibile eliminare', 'error'); return; }
+    await _cap6Reload();
+  }
+  async function cap6DelMov(mov) {
+    const jp = state.currentClient?.json_path;
+    const s = (state.cap6Schede || []).find(x => x.mov === mov);
+    if (!jp || !s) return;
+    if (!window.confirm('Eliminare l\'intera movimentazione (tutte le schede S e la scheda T)?')) return;
+    const r = await call('cap6_elimina_scheda', jp, s.id, true);
+    if (!r || !r.ok) { toast((r && r.error) || 'Impossibile eliminare', 'error'); return; }
+    await _cap6Reload();
+  }
+  async function cap6Ripristina() {
+    const jp = state.currentClient?.json_path; if (!jp) return;
+    if (!window.confirm('Ripristinare le schede originali (annulla aggiunte ed eliminazioni)?')) return;
+    const r = await call('cap6_ripristina_schede', jp);
+    if (r && r.ok) await _cap6Reload();
   }
 
   // ── Maschera MISURE di prevenzione/protezione (SCHEDA MOVIMENTAZIONE) ──
@@ -6568,6 +7207,7 @@ const App = (() => {
         <span class="c6n-hdr-t">Sollevamento / abbassamento</span>
         <span class="c6n-sex">${escHtml(s.sesso)} · ${escHtml(etaLbl)}</span>
         ${_cap6ManualeHtml(s)}
+        ${s.origine === 'libera' ? `<button type="button" class="c6n-x" title="Elimina questa scheda S" onclick="App.cap6DelS(${i})">✕</button>` : ''}
       </div>
       ${_cap6DatiTecnicoHtml(s, 'S')}
       <div class="c6n-row2">
@@ -6837,6 +7477,22 @@ const App = (() => {
   const C10_LIVELLI = ['Irrilevante', 'Basso', 'Medio', 'Alto'];
   const _c10Timers = {};
 
+  // Calcolatore del tempo di esposizione: la somma dei minuti del gruppo non deve
+  // superare 480 (turno di 8 ore).
+  function _c10TotHtml(g) {
+    const tot = (g.misure || []).reduce((a, m) => a + (parseFloat(m.tempo_min) || 0), 0);
+    const over = tot > 480;
+    const col = over ? '#c0392b' : 'var(--gray-600)';
+    return `<span style="font-size:12px;font-weight:700;color:${col}">Tempo totale: ${tot} / 480 min`
+      + (over ? ` — superati di ${tot - 480} min (la somma non deve superare 480)` : ` — residuo ${480 - tot} min`)
+      + `</span>`;
+  }
+  function _c10UpdTot(fieldId, gi) {
+    const g = (state.formValues[fieldId] || {}).gruppi_omogenei?.[gi];
+    const el = document.getElementById(`c10-tot-${fieldId}-${gi}`);
+    if (g && el) el.innerHTML = _c10TotHtml(g);
+  }
+
   function _c10f(v, d) {
     if (v === null || v === undefined || (typeof v === 'number' && !isFinite(v))) return '—';
     return Number(v).toFixed(d === undefined ? 1 : d).replace('.', ',');
@@ -6853,7 +7509,6 @@ const App = (() => {
     state.formValues[fieldId] = {
       versione: 2,
       fonometro_tipo: (ok && data.fonometro_tipo) || '',
-      fonometri_extra: (ok && Array.isArray(data.fonometri_extra)) ? data.fonometri_extra : [],
       gruppi_omogenei: gruppi,
       prescrizioni: Object.assign({}, defaultPrescrizioni, prescrizioni),
     };
@@ -6874,16 +7529,12 @@ const App = (() => {
   function buildCap10Editor(fieldId, data) {
     const ed = state.formValues[fieldId] || {};
     const fonId = ed.fonometro_tipo || '';
-    const extra = ed.fonometri_extra || [];
     const gruppi = ed.gruppi_omogenei || [];
     const prescrizioni = ed.prescrizioni || {};
 
     const optsFon = C10_FONOMETRI.map(f =>
       `<option value="${f.id}"${f.id === fonId ? ' selected' : ''}>${escHtml(f.label)} (Classe ${f.classe})</option>`
     ).join('');
-    const extraHtml = C10_FONOMETRI.filter(f => f.id !== fonId).map(f => `
-      <label class="c10-att-row"><input type="checkbox" ${extra.includes(f.id) ? 'checked' : ''}
-        onchange="App.onC10FonExtra('${fieldId}','${f.id}',this.checked)"><span>${escHtml(f.label)}</span></label>`).join('');
 
     const gruppiHtml = gruppi.map((g, gi) => _c10GruppoHtml(fieldId, gi, g)).join('');
     const prescHtml = C10_PRESCRIZIONI.map(([key, label]) => `
@@ -6913,8 +7564,6 @@ const App = (() => {
             ${optsFon}
           </select>
         </div>
-        ${fonId ? `<div class="c10-subsec-hdr c10-mt">Altri fonometri usati (facoltativo)</div>
-        <div class="c10-att-grid">${extraHtml}</div>` : ''}
       </div>
 
       <div class="c10-section">
@@ -6995,6 +7644,7 @@ const App = (() => {
             <th>L<sub>Aeq</sub> [dBA]</th><th>L<sub>Ceq</sub> [dBC]</th><th>L<sub>picco</sub> [dBC]</th><th></th></tr></thead>
           <tbody>${righe || `<tr><td colspan="7" class="c10-empty-hint">Nessuna misurazione.</td></tr>`}</tbody>
         </table>
+        <div class="c10-tot" id="c10-tot-${fieldId}-${gi}">${_c10TotHtml(g)}</div>
         <button class="c10-add-sm-btn" onclick="App.onC10AddMisura('${fieldId}',${gi})">${ic('plus', 12)} Aggiungi attrezzatura</button>
       </div>
 
@@ -7026,7 +7676,10 @@ const App = (() => {
       const dpiRows = (r.dpi || []).map(d => `<tr>${td(d.n)}${td(escHtml(d.attrezzatura))}${td(_c10f(d.laeq_m))}${td(d.lceq_m === null ? '' : _c10f(d.lceq_m))}${td(_c10f(d.laeq_dpi))}${td(d.stima)}</tr>`).join('');
       const optsR = ['<option value="">Automatico (' + r.rischio + ')</option>']
         .concat(C10_LIVELLI.map(l => `<option value="${l}"${g.rischio_manuale === l ? ' selected' : ''}>${l}</option>`)).join('');
+      const allerta = r.lex > 87
+        ? `<div style="background:#fdecea;border:1.5px solid #c0392b;color:#c0392b;border-radius:8px;padding:8px 12px;margin-bottom:8px;font-weight:700;font-size:13px">⚠ ATTENZIONE: L<sub>EX,8h</sub> = ${_c10f(r.lex)} dBA — supera 87 dBA</div>` : '';
       box.innerHTML = `
+        ${allerta}
         ${r.troncato ? '<div class="c10-empty-hint">Attenzione: oltre 30 attrezzature, le ultime non sono calcolate.</div>' : ''}
         ${r.insufficienti ? '<div class="c10-empty-hint">Attenzione: con il massimo SNR cercato restano righe «Insufficiente».</div>' : ''}
         <div class="c10-subsec-desc">Riepilogo L<sub>EX,8h</sub> (foglio 3)</div>
@@ -7051,16 +7704,7 @@ const App = (() => {
   function onC10Fonometro(fieldId, val) {
     const ed = state.formValues[fieldId]; if (!ed) return;
     ed.fonometro_tipo = val;
-    ed.fonometri_extra = (ed.fonometri_extra || []).filter(f => f !== val);
     _c10Rebuild(fieldId);
-  }
-
-  function onC10FonExtra(fieldId, id, checked) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const s = new Set(ed.fonometri_extra || []);
-    if (checked) s.add(id); else s.delete(id);
-    ed.fonometri_extra = Array.from(s);
-    saveChapterDraft();
   }
 
   function onC10GruppoField(fieldId, gi, key, value) {
@@ -7106,6 +7750,7 @@ const App = (() => {
     m[key] = key === 'attrezzatura' ? value : (value === '' ? '' : parseFloat(value));
     if (typeof m[key] === 'number' && isNaN(m[key])) m[key] = '';
     saveChapterDraft();
+    _c10UpdTot(fieldId, gi);
     _c10Calc(fieldId, gi);
   }
 
@@ -7244,10 +7889,21 @@ const App = (() => {
     </div>`;
   }
 
+  // Stato aperto/chiuso dei gruppi: lo decide l'utente (non si riapre da solo il primo G.O.)
+  const _grpOpen = { c7: null, c6b: null };
+  function grpOpenToggle(kind, el) {
+    const ed = el.closest('.c6-editor') || document;
+    _grpOpen[kind] = new Set([...ed.querySelectorAll('details.c6-gruppo[data-num]')]
+      .filter(d => d.open).map(d => d.dataset.num));
+  }
+  function _grpIsOpen(kind, g, nSel) {
+    return _grpOpen[kind] ? _grpOpen[kind].has(String(g.numero)) : nSel > 0;
+  }
+
   function _buildC7Gruppo(fieldId, gi, g, cat) {
     const sel = g.schede || [];
-    const open = sel.length > 0 ? ' open' : '';
-    return `<details class="c6-gruppo"${open}>
+    const open = _grpIsOpen('c7', g, sel.length) ? ' open' : '';
+    return `<details class="c6-gruppo"${open} data-num="${escAttr(String(g.numero))}" ontoggle="App.grpOpenToggle('c7', this)">
       <summary class="c6-gruppo-hdr">
         <span class="c6-gruppo-tit"><b>Gruppo ${g.numero}</b> — ${escHtml(g.nome || '')}</span>
         <span class="c6-gruppo-badge${sel.length ? ' on' : ''}">${sel.length} scheda/e</span>
@@ -7409,8 +8065,8 @@ const App = (() => {
 
   function _buildC6bGruppo(fieldId, gi, g, cat) {
     const sel = g.modelli || [];
-    const open = sel.length > 0 ? ' open' : '';
-    return `<details class="c6-gruppo"${open}>
+    const open = _grpIsOpen('c6b', g, sel.length) ? ' open' : '';
+    return `<details class="c6-gruppo"${open} data-num="${escAttr(String(g.numero))}" ontoggle="App.grpOpenToggle('c6b', this)">
       <summary class="c6-gruppo-hdr">
         <span class="c6-gruppo-tit"><b>Gruppo ${g.numero}</b> — ${escHtml(g.nome || '')}</span>
         <span class="c6-gruppo-badge${sel.length ? ' on' : ''}">${sel.length} modello/i</span>
@@ -7524,7 +8180,8 @@ const App = (() => {
     }
     box.innerHTML = head
       + schede.map((s, i) => _cap6bSchedaHtml(s, i)).join('')
-      + _cap6bAddHtml(fieldId);
+      + _cap6bAddHtml(fieldId)
+      + `<div style="margin:6px 0"><button type="button" class="btn btn-ghost btn-sm" onclick="App.cap6bRipristina('${fieldId}')">↺ Ripristina le schede originali</button></div>`;
     schede.forEach((s, i) => _cap6bUpdateRes(i));
   }
 
@@ -7576,7 +8233,7 @@ const App = (() => {
   }
   async function cap6bRimuovi(fieldId, sid) {
     const jp = state.currentClient?.json_path;
-    if (!jp || !confirm('Rimuovere questa valutazione aggiunta a mano?')) return;
+    if (!jp || !confirm('Eliminare questa scheda? (si può ripristinare con «Ripristina schede originali»)')) return;
     const r = await call('rimuovi_cap6b_valutazione', jp, sid).catch(() => null);
     if (r && r.ok) _loadCap6bNative(fieldId);
   }
@@ -7606,8 +8263,8 @@ const App = (() => {
       <header class="c6n-group-hdr">
         <span class="c6n-group-tag">Scheda ${s.num || (i + 1)}</span>
         <span class="c6n-group-nome">${escHtml(s.gruppo_nome ? `Gruppo ${s.gruppo_label} — ${s.gruppo_nome}` : (s.gruppo_label ? `Gruppo ${s.gruppo_label}` : 'Gruppo omogeneo'))}</span>
-        ${s.manuale ? `<span class="c6n-man-badge">Aggiunta dal back office</span>
-          <button type="button" class="c6n-group-tpl" onclick="App.cap6bRimuovi('${escAttr(_cap6bFieldId())}','${escAttr(s.id)}')">Rimuovi</button>` : ''}
+        ${s.manuale ? `<span class="c6n-man-badge">Aggiunta dal back office</span>` : ''}
+        <button type="button" class="c6n-group-tpl" onclick="App.cap6bRimuovi('${escAttr(_cap6bFieldId())}','${escAttr(s.id)}')">Elimina scheda</button>
       </header>
       <div class="c6n-group-body">
         <div class="c6n-grid">
@@ -7745,6 +8402,7 @@ const App = (() => {
     box.innerHTML = head
       + schede.map((s, i) => _cap7SchedaHtml(s, i)).join('')
       + _cap7AddHtml(fieldId)
+      + `<div style="margin:6px 0"><button type="button" class="btn btn-ghost btn-sm" onclick="App.cap7Ripristina('${fieldId}')">↺ Ripristina le schede originali</button></div>`
       + (schede.length ? `<div class="c6n-misure-bar"><button type="button" class="btn btn-primary c6n-misure-btn" onclick="App.saveCap7Schede('${fieldId}')">
           <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
           Salva schede OCRA</button></div>` : '');
@@ -7799,9 +8457,22 @@ const App = (() => {
     if (r && r.ok) { toast('Scheda aggiunta: compila i valori OCRA', 'success'); _loadCap7Native(fieldId); }
     else toast((r && r.error) || 'Errore', 'error');
   }
+  async function cap7Ripristina(fieldId) {
+    const jp = state.currentClient?.json_path;
+    if (!jp || !confirm('Ripristinare le schede originali eliminate?')) return;
+    const r = await call('ripristina_cap7_valutazioni', jp).catch(() => null);
+    if (r && r.ok) _loadCap7Native(fieldId);
+  }
+  async function cap6bRipristina(fieldId) {
+    const jp = state.currentClient?.json_path;
+    if (!jp || !confirm('Ripristinare le schede originali eliminate?')) return;
+    const r = await call('ripristina_cap6b_valutazioni', jp).catch(() => null);
+    if (r && r.ok) _loadCap6bNative(fieldId);
+  }
+
   async function cap7Rimuovi(fieldId, sid) {
     const jp = state.currentClient?.json_path;
-    if (!jp || !confirm('Rimuovere questa valutazione aggiunta a mano?')) return;
+    if (!jp || !confirm('Eliminare questa scheda? (si può ripristinare con «Ripristina schede originali»)')) return;
     const r = await call('rimuovi_cap7_valutazione', jp, sid).catch(() => null);
     if (r && r.ok) _loadCap7Native(fieldId);
   }
@@ -7819,8 +8490,8 @@ const App = (() => {
         <span class="c6n-group-tag">Scheda ${s.num || (i + 1)}</span>
         <span class="c6n-group-nome">${escHtml(s.gruppo_nome ? `Gruppo ${s.gruppo_label} — ${s.gruppo_nome}` : (s.gruppo_label ? `Gruppo ${s.gruppo_label}` : 'Gruppo omogeneo'))}</span>
         <span class="c6n-group-badge">${escHtml(s.fase || '—')}</span>
-        ${s.manuale ? `<span class="c6n-man-badge">Aggiunta dal back office</span>
-          <button type="button" class="c6n-group-tpl" onclick="App.cap7Rimuovi('${escAttr(_cap7FieldId())}','${escAttr(s.id)}')">Rimuovi</button>` : ''}
+        ${s.manuale ? `<span class="c6n-man-badge">Aggiunta dal back office</span>` : ''}
+        <button type="button" class="c6n-group-tpl" onclick="App.cap7Rimuovi('${escAttr(_cap7FieldId())}','${escAttr(s.id)}')">Elimina scheda</button>
       </header>
       <div class="c6n-group-body">
         ${q ? `<div class="c6n-m"><b>Valutazione tecnico:</b> ${escHtml(q)}</div>` : ''}
@@ -8250,21 +8921,19 @@ const App = (() => {
     saveChapterDraft();
   }
 
-  /* ── Cap11 — Vibrazioni ─────────────────────────────────────────────── */
-  const C11_PRESCRIZIONI_HAV = [
+  /* ── Cap11 — Vibrazioni (v2 2026-11-23: calcoli dei fogli Excel replicati, Excel non si apre) ── */
+  const C11_PRESC_HAV = [
     ['scelta_attrezzature',    'Scelta di attrezzature adeguate tenendo conto dell\'emissione di vibrazioni'],
     ['manutenzione',           'Manutenzione regolare delle attrezzature di lavoro'],
     ['informazione_formazione','Informazione e formazione dei lavoratori sull\'uso corretto delle attrezzature'],
     ['guanti_antivibrazione',  'Utilizzo di guanti antivibrazioni (DPI)'],
   ];
-
-  const C11_PRESCRIZIONI_WBV = [
+  const C11_PRESC_WBV = [
     ['scelta_attrezzature',    'Scelta di attrezzature adeguate tenendo conto dell\'emissione di vibrazioni'],
     ['supporti_elastici',      'Utilizzo di sedili ammortizzati o supporti elastici che attenuino le vibrazioni'],
     ['manutenzione',           'Manutenzione regolare delle attrezzature di lavoro'],
     ['informazione_formazione','Informazione e formazione dei lavoratori sull\'uso corretto delle attrezzature'],
   ];
-
   const C11_PRESCRIZIONI_GEN = [
     ['altri_metodi_lavoro',          'Adottare altri metodi di lavoro che comportino una minore esposizione alle vibrazioni meccaniche'],
     ['scelta_attrezzature_adeguate', 'Scegliere attrezzature adeguate, ergonomicamente concepite, che producano il minore livello di vibrazioni possibile'],
@@ -8277,395 +8946,253 @@ const App = (() => {
     ['indumenti_protezione',         'Fornitura ai lavoratori di indumenti per la protezione dal freddo e dall\'umidità'],
   ];
 
-  function _c11DefaultGruppo(id) {
+  function _c11DefaultGruppo(id, nome) {
     return {
-      id, nome: `Gruppo ${id}`,
-      hav: { presente: false, attrezzature: [] },
-      wbv: { presente: false, attrezzature: [] },
-      prescrizioni_hav: { scelta_attrezzature: false, manutenzione: false, informazione_formazione: false, guanti_antivibrazione: false, altri_dpi: '' },
-      prescrizioni_wbv: { scelta_attrezzature: false, supporti_elastici: false, manutenzione: false, informazione_formazione: false, altri_dpi: '' },
+      id, nome: nome || `Gruppo ${id}`, descrizione_attivita: '',
+      hav: false, wbv: false, hav_att: [], wbv_att: [],
+      presc_hav: { scelta_attrezzature: false, manutenzione: false, informazione_formazione: false, guanti_antivibrazione: false, altri_dpi: '' },
+      presc_wbv: { scelta_attrezzature: false, supporti_elastici: false, manutenzione: false, informazione_formazione: false },
     };
   }
-
-  function _c11DefaultHavAtt() {
-    return { tipo: '', marca_modello: '', modalita: '', avi: '', arto_dx: true, arto_sx: true, fattore_correttivo: 1.0, tempo_min: '' };
-  }
-
-  function _c11DefaultWbvAtt() {
-    return { tipo: '', marca_modello: '', modalita: '', awmaxi: '', tempo_min: '' };
-  }
+  const _c11AttVuota = () => ({ tipo: '', marca_modello: '', modalita: '', awx: '', awy: '', awz: '', tempo_min: '' });
 
   function initCap11Editor(fieldId, data) {
-    const gruppi = Array.isArray(data && data.gruppi_omogenei) ? data.gruppi_omogenei : [];
+    const d = data || {};
     const genDefaults = {};
     C11_PRESCRIZIONI_GEN.forEach(([k]) => { genDefaults[k] = false; });
+    const gr = (d.versione === 2 && Array.isArray(d.gruppi)) ? d.gruppi : [];
     state.formValues[fieldId] = {
-      gruppi_omogenei: gruppi.length ? gruppi : [_c11DefaultGruppo(1)],
-      prescrizioni_generali: Object.assign({}, genDefaults, (data && data.prescrizioni_generali) || {}),
+      versione: 2,
+      accelerometro: String(d.accelerometro || '9') === '11' ? '11' : '9',
+      gruppi: gr.length ? gr : [_c11DefaultGruppo(1)],
+      prescrizioni_generali: Object.assign({}, genDefaults, d.prescrizioni_generali || {}),
     };
   }
 
   function _c11Rebuild(fieldId) {
     const outer = document.querySelector(`[data-field-id="${fieldId}"]`);
     if (outer) outer.innerHTML = buildCap11Editor(fieldId, state.formValues[fieldId]);
+    _c11InitRisultati(fieldId);
     saveChapterDraft();
   }
 
-  function _c11HavA8(atts) {
-    let sumSq = 0;
-    for (const a of (atts || [])) {
-      const avi = parseFloat(a.avi) || 0;
-      const tOre = (parseFloat(a.tempo_min) || 0) / 60;
-      sumSq += avi * avi * tOre;
-    }
-    return sumSq > 0 ? Math.sqrt(sumSq / 8) : 0;
+  // ---- calcoli (identici a core/cap11_calc.py e ai fogli Excel) ----
+  const _n = v => { const x = parseFloat(String(v ?? '').replace(',', '.')); return isNaN(x) ? 0 : x; };
+  const _fm = (v, d = 2) => (Number(v) || 0).toFixed(d).replace('.', ',');
+  function _c11Hav(atts) {
+    let somma = 0;
+    const righe = (atts || []).map(a => {
+      const avi = Math.sqrt(_n(a.awx) ** 2 + _n(a.awy) ** 2 + _n(a.awz) ** 2);
+      const te = _n(a.tempo_min) / 60;
+      somma += avi * avi * te;
+      return { avi, te, a8i: Math.sqrt(te / 8) * avi };
+    });
+    const a8 = Math.sqrt(somma / 8);
+    return { righe, a8, fascia: a8 > 5 ? 'alto' : (a8 >= 2.5 ? 'medio' : 'basso') };
   }
-
-  function _c11WbvA8(atts) {
-    let sumSq = 0;
-    for (const a of (atts || [])) {
-      const awmax = parseFloat(a.awmaxi) || 0;
-      const tOre = (parseFloat(a.tempo_min) || 0) / 60;
-      sumSq += awmax * awmax * tOre;
-    }
-    return sumSq > 0 ? Math.sqrt(sumSq / 8) : 0;
+  function _c11Wbv(atts) {
+    let somma = 0;
+    const righe = (atts || []).map(a => {
+      const aw = Math.max(1.4 * _n(a.awx), 1.4 * _n(a.awy), _n(a.awz));
+      const te = _n(a.tempo_min) / 60;
+      somma += aw * aw * te;
+      return { aw, te, a8i: Math.sqrt(te / 8) * aw };
+    });
+    const a8 = Math.sqrt(somma / 8);
+    return { righe, a8, fascia: a8 > 1 ? 'alto' : (a8 >= 0.5 ? 'medio' : 'basso') };
   }
-
-  function _c11FasciaHtml(A8, type) {
-    const basso = type === 'hav' ? 2.5 : 0.5;
-    const limite = type === 'hav' ? 5.0 : 1.0;
-    let cls, lbl;
-    if (A8 >= limite) { cls = 'c11-alto'; lbl = 'ELEVATO'; }
-    else if (A8 >= basso) { cls = 'c11-medio'; lbl = 'MEDIO'; }
-    else { cls = 'c11-basso'; lbl = 'BASSO'; }
-    return `<span class="c11-fascia ${cls}">${lbl}</span>`;
+  const _C11_LBL = { basso: 'BASSO', medio: 'MEDIO', alto: 'ALTO (inaccettabile)' };
+  function _c11Badge(r, ov, kind) {
+    const f = r.fascia;
+    const col = f === 'alto' ? '#b91c1c' : (f === 'medio' ? '#b45309' : '#15803d');
+    const sorv = kind === 'hav' ? r.a8 >= 2.5 : r.a8 >= 0.5;
+    return `<span style="font-weight:800;color:${col}">Rischio ${_C11_LBL[f]}</span>
+      <span style="color:var(--gray-500);margin-left:10px">Sorveglianza sanitaria: <b>${sorv ? 'prevista' : 'non prevista'}</b></span>`;
   }
 
   function buildCap11Editor(fieldId, data) {
     const ed = state.formValues[fieldId] || {};
-    const gruppi = ed.gruppi_omogenei || [];
     const presGen = ed.prescrizioni_generali || {};
-
-    const gruppiHtml = gruppi.map((g, gi) => _c11GruppoHtml(fieldId, gi, g)).join('');
-
     const presGenHtml = C11_PRESCRIZIONI_GEN.map(([key, label]) => `
       <label class="c11-presc-row">
         <input type="checkbox" class="c11-presc-cb" ${presGen[key] ? 'checked' : ''}
           onchange="App.onC11PrescrizioneGen('${fieldId}','${key}',this.checked)">
         <span>${escHtml(label)}</span>
       </label>`).join('');
-
     return `<div class="c11-editor" id="c11-editor-${fieldId}">
+      <div class="c11-section">
+        <div class="c11-section-hdr">Strumentazione — accelerometro usato in sede di sopralluogo</div>
+        <div style="padding:14px 18px;display:flex;gap:18px;flex-wrap:wrap">
+          <label class="c11-presc-row"><input type="radio" name="c11-acc-${fieldId}" ${ed.accelerometro !== '11' ? 'checked' : ''}
+            onchange="App.onC11Acc('${fieldId}','9')"><span>Accelerometro n. 9 (MARCHE)</span></label>
+          <label class="c11-presc-row"><input type="radio" name="c11-acc-${fieldId}" ${ed.accelerometro === '11' ? 'checked' : ''}
+            onchange="App.onC11Acc('${fieldId}','11')"><span>Accelerometro n. 11 (LIGURIA)</span></label>
+        </div>
+      </div>
       <div class="c11-section">
         <div class="c11-section-hdr">Gruppi omogenei esposti a vibrazioni</div>
         <div style="padding:14px 18px">
-          ${gruppiHtml}
+          ${(ed.gruppi || []).map((g, gi) => _c11GruppoHtml(fieldId, gi, g)).join('')}
           <button class="c11-add-btn" onclick="App.onC11AddGruppo('${fieldId}')">+ Aggiungi gruppo omogeneo</button>
         </div>
       </div>
-
       <div class="c11-section">
-        <div class="c11-section-hdr">Misure di prevenzione e protezione generali (art. 203 D.Lgs 81/08)</div>
-        <div style="padding:14px 18px">
-          <div class="c11-prescrizioni">${presGenHtml}</div>
-        </div>
+        <div class="c11-section-hdr">Misure di prevenzione e protezione generali</div>
+        <div style="padding:14px 18px"><div class="c11-prescrizioni">${presGenHtml}</div></div>
       </div>
     </div>`;
   }
 
   function _c11GruppoHtml(fieldId, gi, g) {
-    const havHtml = g.hav && g.hav.presente ? _c11HavHtml(fieldId, gi, g) : '';
-    const wbvHtml = g.wbv && g.wbv.presente ? _c11WbvHtml(fieldId, gi, g) : '';
-
-    return `<div class="c11-gruppo" id="c11-g-${fieldId}-${gi}">
+    const fid = escHtml(fieldId);
+    return `<div class="c11-gruppo" id="c11-g-${fid}-${gi}">
       <div class="c11-gruppo-hdr">
         <span class="c11-gruppo-n">Gruppo omogeneo ${gi + 1}${g.nome ? ' — ' + escHtml(g.nome) : ''}</span>
         <button class="c11-rm-btn" onclick="App.onC11RemoveGruppo('${fieldId}',${gi})" title="Rimuovi gruppo">✕</button>
       </div>
       <div class="c11-gruppo-body">
-        <div class="c11-field-row">
-          <label class="c11-lbl">Nome gruppo</label>
-          <input class="c11-inp" type="text" value="${escHtml(g.nome || '')}"
-            onchange="App.onC11GruppoField('${fieldId}',${gi},'nome',this.value)"
-            placeholder="es. Operatori carpenteria">
-        </div>
+        <div class="c11-field-row"><label class="c11-lbl">Nome gruppo</label>
+          <input class="c11-inp" type="text" value="${escHtml(g.nome || '')}" onchange="App.onC11GruppoField('${fieldId}',${gi},'nome',this.value)"></div>
+        <div class="c11-field-row" style="align-items:flex-start"><label class="c11-lbl">Descrizione delle attività che comportano l'esposizione a vibrazioni</label>
+          <textarea class="c11-inp" rows="3" onchange="App.onC11GruppoField('${fieldId}',${gi},'descrizione_attivita',this.value)">${escHtml(g.descrizione_attivita || '')}</textarea></div>
         <div class="c11-toggle-row">
           <span class="c11-toggle-lbl">Vibrazioni mano-braccio (HAV)</span>
-          <label class="c11-toggle">
-            <input type="checkbox" ${g.hav && g.hav.presente ? 'checked' : ''}
-              onchange="App.onC11HavToggle('${fieldId}',${gi},this.checked)">
-            <span class="c11-toggle-slider"></span>
-          </label>
+          <label class="c11-toggle"><input type="checkbox" ${g.hav ? 'checked' : ''} onchange="App.onC11Toggle('${fieldId}',${gi},'hav',this.checked)"><span class="c11-toggle-slider"></span></label>
           <span class="c11-toggle-lbl" style="margin-left:12px">Vibrazioni al corpo intero (WBV)</span>
-          <label class="c11-toggle">
-            <input type="checkbox" ${g.wbv && g.wbv.presente ? 'checked' : ''}
-              onchange="App.onC11WbvToggle('${fieldId}',${gi},this.checked)">
-            <span class="c11-toggle-slider"></span>
-          </label>
+          <label class="c11-toggle"><input type="checkbox" ${g.wbv ? 'checked' : ''} onchange="App.onC11Toggle('${fieldId}',${gi},'wbv',this.checked)"><span class="c11-toggle-slider"></span></label>
         </div>
-        ${havHtml}
-        ${wbvHtml}
+        ${g.hav ? _c11BloccoHtml(fieldId, gi, g, 'hav') : ''}
+        ${g.wbv ? _c11BloccoHtml(fieldId, gi, g, 'wbv') : ''}
       </div>
     </div>`;
   }
 
-  function _c11HavHtml(fieldId, gi, g) {
-    const atts = (g.hav && g.hav.attrezzature) || [];
-    const preHav = g.prescrizioni_hav || {};
-
-    const attRows = atts.map((a, ai) => {
-      const tOre = (parseFloat(a.tempo_min) || 0) / 60;
-      const avi = parseFloat(a.avi) || 0;
-      const gfc = parseFloat(a.fattore_correttivo) || 1.0;
-      const a8i = (tOre > 0 && avi > 0) ? (avi * Math.sqrt(tOre / 8) * gfc).toFixed(3) : '—';
-      return `<tr>
-        <td><input class="c11-meas" type="text" value="${escHtml(a.tipo || '')}"
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'tipo',this.value)" placeholder="Attrezzatura"></td>
-        <td><input class="c11-meas" type="text" value="${escHtml(a.marca_modello || '')}"
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'marca_modello',this.value)" placeholder="—"></td>
-        <td><input class="c11-meas" type="text" value="${escHtml(a.modalita || '')}"
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'modalita',this.value)" placeholder="—"></td>
-        <td><input class="c11-meas-n" type="number" step="0.01" value="${a.avi !== '' && a.avi !== undefined ? a.avi : ''}"
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'avi',this.value)" placeholder="—"></td>
-        <td style="text-align:center"><input type="checkbox" ${a.arto_dx ? 'checked' : ''}
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'arto_dx',this.checked)"></td>
-        <td style="text-align:center"><input type="checkbox" ${a.arto_sx ? 'checked' : ''}
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'arto_sx',this.checked)"></td>
-        <td><input class="c11-meas-n" type="number" step="0.1" min="0.1" value="${a.fattore_correttivo !== undefined && a.fattore_correttivo !== '' ? a.fattore_correttivo : 1.0}"
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'fattore_correttivo',this.value)" placeholder="1.0"></td>
-        <td><input class="c11-meas-n" type="number" step="1" min="0" value="${a.tempo_min !== '' && a.tempo_min !== undefined ? a.tempo_min : ''}"
-          onchange="App.onC11HavField('${fieldId}',${gi},${ai},'tempo_min',this.value)" placeholder="0"></td>
-        <td class="c11-calc">${tOre > 0 ? tOre.toFixed(2) : '—'}</td>
-        <td class="c11-calc">${a8i}</td>
-        <td><button class="c11-rm-inline" onclick="App.onC11RemoveHav('${fieldId}',${gi},${ai})">✕</button></td>
-      </tr>`;
-    }).join('');
-
-    const A8 = _c11HavA8(atts);
-    const A8fmt = A8 > 0 ? A8.toFixed(3) : '—';
-
-    const presRows = C11_PRESCRIZIONI_HAV.map(([key, label]) => `
-      <label class="c11-presc-row">
-        <input type="checkbox" class="c11-presc-cb" ${preHav[key] ? 'checked' : ''}
-          onchange="App.onC11PrescrizioneHav('${fieldId}',${gi},'${key}',this.checked)">
-        <span>${escHtml(label)}</span>
-      </label>`).join('');
-
-    return `<div class="c11-vib-block c11-hav-block">
-      <div class="c11-vib-hdr">Vibrazioni mano-braccio (HAV) — UNI EN ISO 5349-1</div>
+  function _c11BloccoHtml(fieldId, gi, g, kind) {
+    const hav = kind === 'hav';
+    const atts = (hav ? g.hav_att : g.wbv_att) || [];
+    const pre = (hav ? g.presc_hav : g.presc_wbv) || {};
+    const idp = `c11r-${fieldId}-${gi}-${kind}`;
+    const inp = (ai, key, cls, extra = '') => `<input class="${cls}" ${extra} value="${escHtml(String(atts[ai][key] ?? ''))}"
+      onchange="App.onC11Att('${fieldId}',${gi},'${kind}',${ai},'${key}',this.value)">`;
+    const rows = atts.map((a, ai) => `<tr>
+        <td>${inp(ai, 'tipo', 'c11-meas', 'type="text" placeholder="Attrezzatura"')}</td>
+        <td>${inp(ai, 'marca_modello', 'c11-meas', 'type="text"')}</td>
+        <td>${inp(ai, 'modalita', 'c11-meas', 'type="text"')}</td>
+        <td>${inp(ai, 'awx', 'c11-meas-n', 'type="number" step="0.01"')}</td>
+        <td>${inp(ai, 'awy', 'c11-meas-n', 'type="number" step="0.01"')}</td>
+        <td>${inp(ai, 'awz', 'c11-meas-n', 'type="number" step="0.01"')}</td>
+        <td class="c11-calc" id="${idp}-${ai}-v"></td>
+        <td>${inp(ai, 'tempo_min', 'c11-meas-n', 'type="number" step="1" min="0"')}</td>
+        <td><button class="c11-rm-inline" onclick="App.onC11RemoveAtt('${fieldId}',${gi},'${kind}',${ai})">✕</button></td>
+      </tr>`).join('');
+    const presRows = (hav ? C11_PRESC_HAV : C11_PRESC_WBV).map(([key, label]) => `
+      <label class="c11-presc-row"><input type="checkbox" class="c11-presc-cb" ${pre[key] ? 'checked' : ''}
+        onchange="App.onC11Presc('${fieldId}',${gi},'${kind}','${key}',this.checked)"><span>${escHtml(label)}</span></label>`).join('');
+    const extra = hav
+      ? `<div class="c11-field-row c11-mt8"><label class="c11-lbl">Altri DPI</label>
+          <input class="c11-inp" type="text" value="${escHtml(pre.altri_dpi || '')}" placeholder="Specificare altri dispositivi di protezione individuale"
+            onchange="App.onC11Presc('${fieldId}',${gi},'hav','altri_dpi',this.value)"></div>`
+      : '';
+    return `<div class="c11-vib-block c11-${kind}-block">
+      <div class="c11-vib-hdr">${hav ? 'Vibrazioni mano-braccio (HAV) — UNI EN ISO 5349-1' : 'Vibrazioni al corpo intero (WBV) — ISO 2631-1'}</div>
       <div class="c11-vib-body">
-        <div style="overflow-x:auto">
-          <table class="c11-meas-table">
-            <thead><tr>
-              <th>Attrezzatura</th><th>Marca/Modello</th><th>Modalità d'uso</th>
-              <th>a<sub>vi</sub> (m/s²)</th><th>Dx</th><th>Sx</th><th>G</th>
-              <th>t (min)</th><th>t (ore)</th><th>A(8)i (m/s²)</th><th></th>
-            </tr></thead>
-            <tbody>${attRows}</tbody>
-            <tfoot><tr class="c11-total-row">
-              <td colspan="9" class="c11-total-lbl">A(8) totale gruppo</td>
-              <td class="c11-total-val">${A8fmt}</td><td></td>
-            </tr></tfoot>
-          </table>
-        </div>
-        <button class="c11-add-sm-btn" onclick="App.onC11AddHav('${fieldId}',${gi})">+ Aggiungi attrezzatura HAV</button>
-        ${A8 > 0 ? `<div class="c11-result-row">Livello di rischio: ${_c11FasciaHtml(A8, 'hav')}
-          <span class="c11-soglie">Soglie: Basso &lt;2,5 — Medio 2,5÷5,0 — Elevato ≥5,0 m/s²</span></div>` : ''}
+        <div style="overflow-x:auto"><table class="c11-meas-table">
+          <thead><tr><th>Attrezzatura</th><th>Marca / modello</th><th>Modalità di utilizzo</th>
+            <th>aw<sub>x</sub> [m/s²]</th><th>aw<sub>y</sub> [m/s²]</th><th>aw<sub>z</sub> [m/s²]</th>
+            <th>${hav ? 'a<sub>vi</sub>' : 'aw<sub>maxi</sub>'} [m/s²]</th>
+            <th>Tempo di esposizione [min]</th><th></th></tr></thead>
+          <tbody>${rows}</tbody>
+          <tfoot><tr class="c11-total-row"><td colspan="7" class="c11-total-lbl">A(8) [m/s²]</td>
+            <td class="c11-total-val" id="${idp}-tot"></td><td></td></tr></tfoot>
+        </table></div>
+        <button class="c11-add-sm-btn" onclick="App.onC11AddAtt('${fieldId}',${gi},'${kind}')">+ Aggiungi attrezzatura ${hav ? 'HAV' : 'WBV'}</button>
+        <div class="c11-result-row" id="${idp}-esito"></div>
         <div class="c11-presc-section">
-          <div class="c11-subsec-hdr">Misure di prevenzione per vibrazioni mano-braccio</div>
-          <div class="c11-prescrizioni">${presRows}</div>
-          <div class="c11-field-row c11-mt8">
-            <label class="c11-lbl">Altri DPI</label>
-            <input class="c11-inp" type="text" value="${escHtml(preHav.altri_dpi || '')}"
-              onchange="App.onC11PrescrizioneHav('${fieldId}',${gi},'altri_dpi',this.value)"
-              placeholder="Specificare altri dispositivi di protezione individuale">
-          </div>
+          <div class="c11-subsec-hdr">Misure di prevenzione e protezione — ${hav ? 'mano-braccio' : 'corpo intero'}</div>
+          <div class="c11-prescrizioni">${presRows}</div>${extra}
         </div>
       </div>
     </div>`;
   }
 
-  function _c11WbvHtml(fieldId, gi, g) {
-    const atts = (g.wbv && g.wbv.attrezzature) || [];
-    const preWbv = g.prescrizioni_wbv || {};
-
-    const attRows = atts.map((a, ai) => {
-      const tOre = (parseFloat(a.tempo_min) || 0) / 60;
-      const awmax = parseFloat(a.awmaxi) || 0;
-      const a8i = (tOre > 0 && awmax > 0) ? (awmax * Math.sqrt(tOre / 8)).toFixed(3) : '—';
-      return `<tr>
-        <td><input class="c11-meas" type="text" value="${escHtml(a.tipo || '')}"
-          onchange="App.onC11WbvField('${fieldId}',${gi},${ai},'tipo',this.value)" placeholder="Attrezzatura"></td>
-        <td><input class="c11-meas" type="text" value="${escHtml(a.marca_modello || '')}"
-          onchange="App.onC11WbvField('${fieldId}',${gi},${ai},'marca_modello',this.value)" placeholder="—"></td>
-        <td><input class="c11-meas" type="text" value="${escHtml(a.modalita || '')}"
-          onchange="App.onC11WbvField('${fieldId}',${gi},${ai},'modalita',this.value)" placeholder="—"></td>
-        <td><input class="c11-meas-n" type="number" step="0.001" value="${a.awmaxi !== '' && a.awmaxi !== undefined ? a.awmaxi : ''}"
-          onchange="App.onC11WbvField('${fieldId}',${gi},${ai},'awmaxi',this.value)" placeholder="—"></td>
-        <td><input class="c11-meas-n" type="number" step="1" min="0" value="${a.tempo_min !== '' && a.tempo_min !== undefined ? a.tempo_min : ''}"
-          onchange="App.onC11WbvField('${fieldId}',${gi},${ai},'tempo_min',this.value)" placeholder="0"></td>
-        <td class="c11-calc">${tOre > 0 ? tOre.toFixed(2) : '—'}</td>
-        <td class="c11-calc">${a8i}</td>
-        <td><button class="c11-rm-inline" onclick="App.onC11RemoveWbv('${fieldId}',${gi},${ai})">✕</button></td>
-      </tr>`;
-    }).join('');
-
-    const A8 = _c11WbvA8(atts);
-    const A8fmt = A8 > 0 ? A8.toFixed(3) : '—';
-
-    const presRows = C11_PRESCRIZIONI_WBV.map(([key, label]) => `
-      <label class="c11-presc-row">
-        <input type="checkbox" class="c11-presc-cb" ${preWbv[key] ? 'checked' : ''}
-          onchange="App.onC11PrescrizioneWbv('${fieldId}',${gi},'${key}',this.checked)">
-        <span>${escHtml(label)}</span>
-      </label>`).join('');
-
-    return `<div class="c11-vib-block c11-wbv-block">
-      <div class="c11-vib-hdr">Vibrazioni al corpo intero (WBV) — ISO 2631-1</div>
-      <div class="c11-vib-body">
-        <div style="overflow-x:auto">
-          <table class="c11-meas-table">
-            <thead><tr>
-              <th>Attrezzatura</th><th>Marca/Modello</th><th>Modalità d'uso</th>
-              <th>a<sub>wmax,i</sub> (m/s²)</th><th>t (min)</th><th>t (ore)</th>
-              <th>A(8)i (m/s²)</th><th></th>
-            </tr></thead>
-            <tbody>${attRows}</tbody>
-            <tfoot><tr class="c11-total-row">
-              <td colspan="6" class="c11-total-lbl">A(8) totale gruppo</td>
-              <td class="c11-total-val">${A8fmt}</td><td></td>
-            </tr></tfoot>
-          </table>
-        </div>
-        <button class="c11-add-sm-btn" onclick="App.onC11AddWbv('${fieldId}',${gi})">+ Aggiungi attrezzatura WBV</button>
-        ${A8 > 0 ? `<div class="c11-result-row">Livello di rischio: ${_c11FasciaHtml(A8, 'wbv')}
-          <span class="c11-soglie">Soglie: Basso &lt;0,5 — Medio 0,5÷1,0 — Elevato ≥1,0 m/s²</span></div>` : ''}
-        <div class="c11-presc-section">
-          <div class="c11-subsec-hdr">Misure di prevenzione per vibrazioni al corpo intero</div>
-          <div class="c11-prescrizioni">${presRows}</div>
-          <div class="c11-field-row c11-mt8">
-            <label class="c11-lbl">Altri DPI</label>
-            <input class="c11-inp" type="text" value="${escHtml(preWbv.altri_dpi || '')}"
-              onchange="App.onC11PrescrizioneWbv('${fieldId}',${gi},'altri_dpi',this.value)"
-              placeholder="Specificare altri dispositivi di protezione individuale">
-          </div>
-        </div>
-      </div>
-    </div>`;
+  // aggiorna SOLO i risultati (nessun ricostruire: non si perde il focus)
+  function _c11Risultati(fieldId, gi) {
+    const ed = state.formValues[fieldId]; const g = ed && ed.gruppi[gi]; if (!g) return;
+    ['hav', 'wbv'].forEach(kind => {
+      if (!g[kind]) return;
+      const atts = (kind === 'hav' ? g.hav_att : g.wbv_att) || [];
+      const r = kind === 'hav' ? _c11Hav(atts) : _c11Wbv(atts);
+      const idp = `c11r-${fieldId}-${gi}-${kind}`;
+      const set = (id, t) => { const el = document.getElementById(id); if (el) el.textContent = t; };
+      r.righe.forEach((x, ai) => {
+        set(`${idp}-${ai}-v`, _fm(kind === 'hav' ? x.avi : x.aw));
+      });
+      set(`${idp}-tot`, _fm(r.a8));
+      const es = document.getElementById(`${idp}-esito`);
+      if (es) es.innerHTML = atts.length ? _c11Badge(r, '', kind) : '';
+    });
   }
 
+  function _c11Post(fieldId, gi) { _c11Risultati(fieldId, gi); saveChapterDraft(); }
+
+  function onC11Acc(fieldId, v) { const ed = state.formValues[fieldId]; if (!ed) return; ed.accelerometro = v; saveChapterDraft(); }
   function onC11GruppoField(fieldId, gi, key, value) {
+    const ed = state.formValues[fieldId]; if (!ed || !ed.gruppi[gi]) return;
+    ed.gruppi[gi][key] = value;
+    if (key === 'nome') _c11Rebuild(fieldId); else _c11Post(fieldId, gi);
+  }
+  function onC11Toggle(fieldId, gi, kind, checked) {
+    const ed = state.formValues[fieldId]; if (!ed || !ed.gruppi[gi]) return;
+    const g = ed.gruppi[gi]; g[kind] = checked;
+    const lst = kind === 'hav' ? 'hav_att' : 'wbv_att';
+    if (checked && !(g[lst] || []).length) g[lst] = [_c11AttVuota()];
+    _c11Rebuild(fieldId); _c11Risultati(fieldId, gi);
+  }
+  function onC11Att(fieldId, gi, kind, ai, key, value) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    g[key] = value;
+    const lst = (kind === 'hav' ? ed.gruppi[gi].hav_att : ed.gruppi[gi].wbv_att);
+    if (!lst[ai]) return;
+    lst[ai][key] = value;
+    _c11Post(fieldId, gi);
+  }
+  function onC11AddAtt(fieldId, gi, kind) {
+    const ed = state.formValues[fieldId]; if (!ed) return;
+    const g = ed.gruppi[gi]; const k = kind === 'hav' ? 'hav_att' : 'wbv_att';
+    (g[k] = g[k] || []).push(_c11AttVuota());
+    _c11Rebuild(fieldId); _c11Risultati(fieldId, gi);
+  }
+  function onC11RemoveAtt(fieldId, gi, kind, ai) {
+    const ed = state.formValues[fieldId]; if (!ed) return;
+    const g = ed.gruppi[gi]; (kind === 'hav' ? g.hav_att : g.wbv_att).splice(ai, 1);
+    _c11Rebuild(fieldId); _c11Risultati(fieldId, gi);
+  }
+  function onC11Presc(fieldId, gi, kind, key, value) {
+    const ed = state.formValues[fieldId]; if (!ed) return;
+    const g = ed.gruppi[gi]; const k = kind === 'hav' ? 'presc_hav' : 'presc_wbv';
+    (g[k] = g[k] || {})[key] = value;
     saveChapterDraft();
   }
-
-  function onC11HavToggle(fieldId, gi, checked) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    if (!g.hav) g.hav = { presente: false, attrezzature: [] };
-    g.hav.presente = checked;
-    if (checked && (!g.hav.attrezzature || !g.hav.attrezzature.length))
-      g.hav.attrezzature = [_c11DefaultHavAtt()];
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11WbvToggle(fieldId, gi, checked) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    if (!g.wbv) g.wbv = { presente: false, attrezzature: [] };
-    g.wbv.presente = checked;
-    if (checked && (!g.wbv.attrezzature || !g.wbv.attrezzature.length))
-      g.wbv.attrezzature = [_c11DefaultWbvAtt()];
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11HavField(fieldId, gi, ai, key, value) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g || !g.hav) return;
-    const a = g.hav.attrezzature[ai]; if (!a) return;
-    if (key === 'arto_dx' || key === 'arto_sx') a[key] = Boolean(value);
-    else if (key === 'avi' || key === 'fattore_correttivo' || key === 'tempo_min')
-      a[key] = value === '' ? '' : (parseFloat(value) || '');
-    else a[key] = value;
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11WbvField(fieldId, gi, ai, key, value) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g || !g.wbv) return;
-    const a = g.wbv.attrezzature[ai]; if (!a) return;
-    if (key === 'awmaxi' || key === 'tempo_min')
-      a[key] = value === '' ? '' : (parseFloat(value) || '');
-    else a[key] = value;
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11AddHav(fieldId, gi) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g || !g.hav) return;
-    g.hav.attrezzature.push(_c11DefaultHavAtt());
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11RemoveHav(fieldId, gi, ai) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g || !g.hav) return;
-    g.hav.attrezzature.splice(ai, 1);
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11AddWbv(fieldId, gi) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g || !g.wbv) return;
-    g.wbv.attrezzature.push(_c11DefaultWbvAtt());
-    _c11Rebuild(fieldId);
-  }
-
-  function onC11RemoveWbv(fieldId, gi, ai) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g || !g.wbv) return;
-    g.wbv.attrezzature.splice(ai, 1);
-    _c11Rebuild(fieldId);
-  }
-
   function onC11AddGruppo(fieldId) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    const id = ed.gruppi_omogenei.length + 1;
-    ed.gruppi_omogenei.push(_c11DefaultGruppo(id));
+    ed.gruppi.push(_c11DefaultGruppo(ed.gruppi.length + 1));
     _c11Rebuild(fieldId);
   }
-
   function onC11RemoveGruppo(fieldId, gi) {
     const ed = state.formValues[fieldId]; if (!ed) return;
-    if (ed.gruppi_omogenei.length <= 1) return;
-    ed.gruppi_omogenei.splice(gi, 1);
-    ed.gruppi_omogenei.forEach((g, i) => { g.id = i + 1; });
+    ed.gruppi.splice(gi, 1);
+    if (!ed.gruppi.length) ed.gruppi.push(_c11DefaultGruppo(1));
     _c11Rebuild(fieldId);
   }
-
-  function onC11PrescrizioneHav(fieldId, gi, key, value) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    if (!g.prescrizioni_hav) g.prescrizioni_hav = {};
-    g.prescrizioni_hav[key] = value;
-    saveChapterDraft();
-  }
-
-  function onC11PrescrizioneWbv(fieldId, gi, key, value) {
-    const ed = state.formValues[fieldId]; if (!ed) return;
-    const g = ed.gruppi_omogenei[gi]; if (!g) return;
-    if (!g.prescrizioni_wbv) g.prescrizioni_wbv = {};
-    g.prescrizioni_wbv[key] = value;
-    saveChapterDraft();
-  }
-
   function onC11PrescrizioneGen(fieldId, key, checked) {
     const ed = state.formValues[fieldId]; if (!ed) return;
     if (!ed.prescrizioni_generali) ed.prescrizioni_generali = {};
     ed.prescrizioni_generali[key] = checked;
     saveChapterDraft();
+  }
+  // dopo il render iniziale: calcola i risultati di tutti i gruppi
+  function _c11InitRisultati(fieldId) {
+    const ed = state.formValues[fieldId]; if (!ed) return;
+    ed.gruppi.forEach((_, gi) => _c11Risultati(fieldId, gi));
   }
 
   /* ── Validate & Save ────────────────────────────────────────────────── */
@@ -8914,6 +9441,7 @@ const App = (() => {
             <button class="btn btn-primary" data-cl-action="save">Salva e sovrascrivi JSON</button>
           </div>
         </div>
+        ${_nCapModificati() > 0 ? `<div class="cl-red-warn">${_WARN_TRI} Hai già modificato ${_nCapModificati()} capitolo/i: salvando e sovrascrivendo il JSON <b>tutte le modifiche fatte andranno perse</b>.</div>` : ''}
         <div class="cl-intro">Controlla e correggi i dati inseriti dal tecnico. Al salvataggio il JSON viene
           sovrascritto e diventa la base <b>definitiva</b> per la generazione del DVR (viene comunque conservato un backup).</div>
         <div id="cl-warnings"></div>
@@ -8926,7 +9454,7 @@ const App = (() => {
     ov.addEventListener('change', _onChecklistInput);
     ov.addEventListener('click', _onChecklistClick);
     ov.addEventListener('keyup', _onChecklistSearch);
-    _loadChecklistWarnings(path);
+    await _loadChecklistWarnings(path);
   }
 
   async function _loadChecklistWarnings(path) {
@@ -8934,25 +9462,7 @@ const App = (() => {
     try { avvisi = await call('controlla_dati', path) || []; } catch (e) { avvisi = []; }
     const box = document.getElementById('cl-warnings');
     if (!box || !avvisi.length) return;
-    const ic = (lv) => lv === 'errore' ? '⛔' : lv === 'attenzione' ? '⚠️' : 'ℹ️';
-    // Box COLLASSABILE + altezza massima con scroll: da chiuso mostra solo
-    // titolo+conteggio, così non occupa mezza schermata e si lavora sui campi
-    // sotto (feedback 2026-10-15). Click sul titolo = apri/chiudi.
-    box.innerHTML = `<div class="cl-warn-box">
-      <div class="cl-warn-title" onclick="App.toggleChecklistWarn()">
-        <span class="cl-warn-chev" id="cl-warn-chev">▸</span>
-        Controllo dati — ${avvisi.length} segnalazion${avvisi.length === 1 ? 'e' : 'i'} (clicca per aprire)
-      </div>
-      <div class="cl-warn-list" id="cl-warn-list" style="display:none">
-      ${avvisi.map(a => {
-        const t = a.target ? ` data-cl-goto="${escAttr(JSON.stringify(a.target))}"` : '';
-        return `<div class="cl-warn-row cl-warn-${escAttr(a.livello)}${a.target ? ' cl-warn-clickable' : ''}"${t}>
-        <div class="cl-warn-msg">${ic(a.livello)} ${escHtml(a.messaggio)}${a.target ? ' <span class="cl-warn-go">→ vai</span>' : ''}</div>
-        ${a.soluzione ? `<div class="cl-warn-fix"><b>Come risolvere:</b> ${escHtml(a.soluzione)}</div>` : ''}
-      </div>`;
-      }).join('')}
-      </div>
-    </div>`;
+    box.innerHTML = _wxBox(avvisi, 'cl-warn-list', 'cl-warn-chev', 'toggleChecklistWarn', '');
     box.querySelectorAll('[data-cl-goto]').forEach(el =>
       el.addEventListener('click', () => gotoChecklistField(el.getAttribute('data-cl-goto'))));
   }
@@ -8971,7 +9481,7 @@ const App = (() => {
     if (!draft || typeof draft !== 'object') return;
     const a = draft.anagrafica = draft.anagrafica || {};
     const scalari = {
-      ragione_sociale: '', partita_iva: '', codice_fiscale: '',
+      ragione_sociale: '', partita_iva: '', codice_fiscale: '', indirizzo_sede_operativa: '',
       indirizzo_sede_legale: '', cap: '', citta: '', provincia: '',
       sede_operativa: '', telefono: '', email: '', pec: '',
       tipologia_attivita: '', codice_ateco: '',
@@ -8994,7 +9504,6 @@ const App = (() => {
     if (!Array.isArray(target) || !target.length) return;
     if (!document.getElementById('checklist-overlay')) {
       await openChecklist();
-      await new Promise(r => setTimeout(r, 90));
     }
     _scrollHighlightChecklist(target);
   }
@@ -9003,33 +9512,49 @@ const App = (() => {
     const ov = document.getElementById('checklist-overlay');
     if (!ov) return null;
     // Miglior match sul data-cl-path (prefisso più lungo che combacia col target)
-    let best = null, bestLen = -1;
+    let best = null, bestLen = -1, bestExact = false;
     ov.querySelectorAll('[data-cl-path]').forEach(el => {
+      if (el.hasAttribute('data-cl-action') && el.getAttribute('data-cl-action') !== 'bool') return; // salta ✕ e + Aggiungi
       let p; try { p = JSON.parse(el.getAttribute('data-cl-path')); } catch (e) { return; }
       if (!Array.isArray(p)) return;
       const n = Math.min(p.length, target.length);
       for (let i = 0; i < n; i++) if (String(p[i]) !== String(target[i])) return;
-      if (n > bestLen) { best = el; bestLen = n; }
+      if (n < target.length && p.length < target.length) { /* percorso piu' corto: solo contenitore */ }
+      const score = n * 10 + (p.length === target.length ? 5 : 0);
+      if (score > bestLen) { best = el; bestLen = score; bestExact = (p.length === target.length && n === target.length); }
     });
-    if (best) return best;
+    if (best) {
+      if (!bestExact) { const c = best.closest('.cl-item, .cl-group'); if (c) return c; }
+      return best;
+    }
     // Fallback: la sottosezione della prima chiave (es. "anagrafica")
     return ov.querySelector(`[data-cl-section="${CSS.escape(String(target[0]))}"]`);
   }
 
   function _scrollHighlightChecklist(target) {
+    const ov = document.getElementById('checklist-overlay');
     const el = _findChecklistTarget(target);
-    if (!el) return;
-    // Espande tutti i <details> antenati (le sezioni chiuse)
+    if (!el || !ov) return;
+    // Espande tutti i <details> antenati (le sezioni chiuse) e toglie il filtro di ricerca
     let d = el.closest('details');
     while (d) { d.open = true; d = d.parentElement && d.parentElement.closest('details'); }
-    const box = el.closest('.cl-field, .cl-item, .cl-group, .cl-subsec') || el;
+    const box = el.closest('.cl-field, .cl-listitem, .cl-item, .cl-group, .cl-subsec') || el;
+    const body = ov.querySelector('.cl-body');
+    // Scroll istantaneo calcolato sul contenitore, ripetuto dopo l'assestamento del layout
+    const vai = () => {
+      if (!body) { box.scrollIntoView({ block: 'center' }); return; }
+      const r = box.getBoundingClientRect(), b = body.getBoundingClientRect();
+      body.scrollTop += (r.top - b.top) - (b.height / 2 - r.height / 2);
+    };
+    vai();
+    requestAnimationFrame(vai);
     setTimeout(() => {
-      box.scrollIntoView({ behavior: 'smooth', block: 'center' });
-      box.classList.add('cl-flash');
+      vai();
+      box.classList.remove('cl-flash'); void box.offsetWidth; box.classList.add('cl-flash');
       const inp = box.querySelector('input, textarea, select');
       if (inp) { try { inp.focus({ preventScroll: true }); } catch (e) {} }
       setTimeout(() => box.classList.remove('cl-flash'), 2800);
-    }, 60);
+    }, 280);
   }
 
   function _clSubsection(sectionKey, data) {
@@ -9364,9 +9889,38 @@ const App = (() => {
     if (q) ov.querySelectorAll('.cl-section').forEach(d => { d.open = true; });
   }
 
+  function _nCapModificati() {
+    return (state.currentClient?.chapters || []).filter(c =>
+      c && !c.manual_edit && ((c.form_data && Object.keys(c.form_data).length) || c.output_path)).length;
+  }
+  function _redConfirm(titolo, testo, okLabel) {
+    return new Promise(res => {
+      const o = document.createElement('div');
+      o.className = 'red-confirm-ov';
+      o.innerHTML = `<div class="red-confirm">
+        <div class="red-confirm-h">${_WARN_TRI}<span>${escHtml(titolo)}</span></div>
+        <div class="red-confirm-t">${testo}</div>
+        <div class="red-confirm-b"><button class="btn btn-outline" data-r="0">Annulla</button>
+          <button class="btn red-confirm-ok" data-r="1">${escHtml(okLabel)}</button></div></div>`;
+      o.addEventListener('click', ev => {
+        const b = ev.target.closest('[data-r]');
+        if (!b && ev.target !== o) return;
+        o.remove(); res(!!b && b.getAttribute('data-r') === '1');
+      });
+      document.body.appendChild(o);
+    });
+  }
+
   async function saveChecklist() {
     const path = state.currentClient?.json_path || '';
     if (!path) { toast('Percorso JSON non disponibile.', 'error'); return; }
+    const nMod = _nCapModificati();
+    if (nMod > 0) {
+      const ok = await _redConfirm('Attenzione: perderai le modifiche già fatte',
+        `Sovrascrivendo il JSON <b>tutte le modifiche fatte ai capitoli (${nMod}) andranno perse</b>: i capitoli già compilati verranno rigenerati dai dati corretti. L'operazione non si può annullare.`,
+        'Sì, sovrascrivi e perdi le modifiche');
+      if (!ok) return;
+    }
     showLoading('Salvataggio JSON…');
     const res = await call('save_json', path, state.checklistDraft);
     hideLoading();
@@ -9717,7 +10271,6 @@ const App = (() => {
     ov.innerHTML = `
       <div class="survey-email-card release-modal">
         <h3>Note di rilascio</h3>
-        <div class="release-version">Presidia · versione 1.6</div>
         <p class="release-copyright">Il presente software è stato ideato e sviluppato da
         <strong>Marco Mancuso</strong>. Opera tutelata ai sensi della normativa vigente in materia
         di diritto d'autore e proprietà intellettuale. Tutti i diritti sono riservati al titolare.
@@ -10236,7 +10789,8 @@ const App = (() => {
 
   return {
     init, showHome, showClient, showConfig, toggleTheme,
-    pickJson, openTechDrive, onDragOver, onDragLeave, onDrop, dismissImportSuccess,
+    pickJson, chiudiChangelog, openTechDrive, apriDrive, driveChiudi, driveApriBrowser, driveApriClienteBrowser, driveApriUrl, driveOrdine, driveSortMenu, driveRecenti, driveLettera, driveAggiorna, driveFiltro, driveScegli, driveIndietro, driveScarica, onDragOver, onDragLeave, onDrop, dismissImportSuccess,
+    apriRas, apriRasCliente, rasScegli, rasApriRecente, rasChiudi, rasCampo, rasGenera, rasApriCartella,
     onPickTipoDvr, toggleDvrType, onToggleCap2Semplificato, setClientSection, generaAllegati,
     apriCartellaAllegati, apriCartellaAllegatiCliente, apriAllegato, apriAllegatoN, onToggleAllegato,
     esportaAllegatiPdf, chiudiAlg32Fullscreen, onAlg32Toggle, onAlg32Pos,
@@ -10262,7 +10816,7 @@ const App = (() => {
     // Cap2 editor
     toggleCap2Group, onCap2FieldChange, onCap2SchedaChange,
     onCap2ListSync, onCap2ListAdd, onCap2ListRemove,
-    addCap2Fase, removeCap2Fase, onCap2FaseDpiToggle, filterDpi,
+    addCap2Fase, importaFasiDaDescrizione, removeCap2Fase, onCap2FaseDpiToggle, filterDpi,
     // Cap3 editor
     toggleCap3Locale, onCap3FieldChange, onCap3RischioChange, onCap3PresenteToggle,
     onCap3AddManual, onCap3AddLocale, onCap3RemoveLocale,
@@ -10289,9 +10843,10 @@ const App = (() => {
     toggleC20Area,
     // Cap6 editor
     onC6VarToggle, onCap6Sel, onCap6Field,
+    onGruppoManuale, cap6AddS, cap6DelS, cap6DelMov, cap6Ripristina, cap7Ripristina, cap6bRipristina,
     openCap6Misure, saveCap6Misure, closeCap6Misure, onCap6MisMain, onCap6MisSub,
     // Cap10 editor
-    onC10Fonometro, onC10FonExtra, onC10GruppoField,
+    onC10Fonometro, onC10GruppoField,
     onC10AddGruppo, onC10RemoveGruppo,
     onC10AddMisura, onC10RemoveMisura, onC10Misura, onC10Rischio,
     onC10Prescrizione,
@@ -10311,12 +10866,9 @@ const App = (() => {
     onC21Settore, onC21GruppoNome, onC21MergeCheck,
     onC21AccorpaSubmit, onC21SciogliGruppo, onC21DataField,
     // Cap11 editor
-    onC11GruppoField, onC11HavToggle, onC11WbvToggle,
-    onC11HavField, onC11WbvField,
-    onC11AddHav, onC11RemoveHav, onC11AddWbv, onC11RemoveWbv,
-    onC11AddGruppo, onC11RemoveGruppo,
-    onC11PrescrizioneHav, onC11PrescrizioneWbv, onC11PrescrizioneGen,
-    exportClientDocx, exportClientPdf, exportAllTogether, compileAllToFolder,
+    onC11Acc, onC11GruppoField, onC11Toggle, onC11Att, onC11AddAtt, onC11RemoveAtt, onC11Presc,
+    onC11AddGruppo, onC11RemoveGruppo, onC11PrescrizioneGen,
+    backClient, grpOpenToggle, exportClientDocx, exportClientPdf, exportAllTogether, compileAllToFolder,
     showReleaseNotes,
     toast, showLoading, hideLoading,
     // Aggiornamenti GitHub
